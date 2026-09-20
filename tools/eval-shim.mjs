@@ -4,9 +4,14 @@
 //
 //   node tools/eval-shim.mjs <plugin-dir> [--case <glob>] [--runs n] [--model m]
 //        [--judge-model m] [--ablation none|with-without] [--json <path>]
+//        [--track pinned|canary]        which .cdc.yml track to run (model/harness/runs/budget come from there)
+//        [--expand-on-deviation n]      sequential testing: after the configured runs, add n more if any run deviated
+//        [--budget <usd>]               stop starting new agent runs once this much has been spent in this invocation
 //        [--output-dir <dir>] [--eval-dir <dir>] [--scaffold] [--no-isolate] [--no-safety-net] [--verbose]
 //        [--regrade <aggregate-result.json>] [--regrade-llm]   re-score saved runs with the current graders (no agent calls;
 //                                                          llm graders keep their saved verdict unless --regrade-llm)
+//
+// Precedence for model / judge / runs: CLI flag > case frontmatter (model only) > .cdc.yml track > built-in default.
 //
 // Safety net: every run (both arms) gets a PreToolUse hook (tools/safety-net.mjs) that blocks host-global
 // destructive commands (docker compose down -v, prune, git push --force, rm -rf outside ws, DROP DATABASE…).
@@ -14,15 +19,16 @@
 //
 // Output: <plugin>/evals/results/<timestamp>/aggregate-result.json (official v1 shape, plus shim:true).
 // Supported graders: regex, tool_used, file_exists, llm. tool_order/baseline are recorded as skipped.
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { promises as fs, existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { renderReport } from './eval-report.mjs';
+import { loadConfig, resolveTrack } from './cdc-config.mjs';
 
 // ---------- args ----------
 const argv = process.argv.slice(2);
-const opt = { case: null, runs: null, model: 'sonnet', judgeModel: 'haiku', ablation: 'with-without', json: null, outputDir: null, isolate: true, verbose: false, scaffold: false, evalDir: null, safetyNet: true, regrade: null, regradeLlm: false };
+const opt = { case: null, runs: null, model: null, judgeModel: null, ablation: 'with-without', json: null, outputDir: null, isolate: true, verbose: false, scaffold: false, evalDir: null, safetyNet: true, regrade: null, regradeLlm: false, track: null, expand: null, budget: null, agent: null };
 let pluginDir = null;
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i], next = () => argv[++i];
@@ -31,6 +37,10 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--model') opt.model = next();
   else if (a === '--judge-model') opt.judgeModel = next();
   else if (a === '--ablation') opt.ablation = next();
+  else if (a === '--track') opt.track = next();
+  else if (a === '--expand-on-deviation') opt.expand = Number(next());
+  else if (a === '--budget') opt.budget = Number(next());
+  else if (a === '--agent') opt.agent = next();
   else if (a === '--json') opt.json = argv[i + 1] && !argv[i + 1].startsWith('--') ? next() : '-';
   else if (a === '--output-dir') opt.outputDir = next();
   else if (a === '--no-isolate') opt.isolate = false;
@@ -46,6 +56,18 @@ for (let i = 0; i < argv.length; i++) {
 if (!pluginDir) die('usage: eval-shim.mjs <plugin-dir> [options]');
 function die(m) { console.error(m); process.exit(1); }
 const log = (...m) => { if (opt.json !== '-') console.error(...m); };
+
+// ---------- track: what this run pins and what it lets float (.cdc.yml) ----------
+const cdc = loadConfig(pluginDir);
+let track;
+try { track = resolveTrack(cdc, opt.track ?? cdc.track); } catch (e) { die(e.message); }
+const agent = opt.agent ?? track.agent;
+if (agent !== 'claude') die(`agent "${agent}" is not supported yet — only claude ships in this version (Codex/Gemini adapters are on the roadmap)`);
+opt.judgeModel ??= track.judgeModel;
+opt.expand ??= track.expandOnDeviation;
+opt.budget ??= track.budget.per_run_usd;
+if (opt.budget !== null && !(opt.budget > 0)) opt.budget = null; // 0 or negative = no cap
+const harnessVersion = (() => { try { return execFileSync('claude', ['--version'], { encoding: 'utf8', timeout: 20_000 }).trim().split(/\s+/)[0] || null; } catch { return null; } })();
 
 // ---------- tiny YAML-subset frontmatter parser ----------
 function parseFrontmatter(src) {
@@ -78,6 +100,39 @@ function parseScalar(v) {
   return v;
 }
 
+// covers.yaml sidecar: rule ids a case exercises. Lives next to prompt.md because the official
+// runner rejects unknown frontmatter keys (a bare `covers:` in prompt.md fails to load there).
+async function readCovers(caseDir) {
+  const p = path.join(caseDir, 'covers.yaml');
+  if (!existsSync(p)) return null;
+  const t = (await fs.readFile(p, 'utf8')).replace(/#[^\n]*/g, '');
+  const b = t.match(/\[([^\]]*)\]/);
+  const items = b ? b[1].split(',') : [...t.matchAll(/^\s*-\s*(.+)$/gm)].map((m) => m[1]);
+  return items.map((s) => s.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
+}
+
+// What the agent could see at plugin load: every SKILL.md under the plugin that parses. A red
+// trigger case then splits into "discovered but never invoked" (suspect the trigger description)
+// vs "not discovered at all" (packaging: renamed dir, missing or malformed SKILL.md).
+async function discoverSkills(root) {
+  const out = [];
+  const walk = async (dir, depth) => {
+    if (depth > 6) return;
+    for (const e of await fs.readdir(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) { if (!['node_modules', '.git', 'results', 'evals', 'target', 'dist'].includes(e.name)) await walk(p, depth + 1); }
+      else if (e.name === 'SKILL.md') {
+        const t = await fs.readFile(p, 'utf8');
+        const name = (t.match(/^---[\s\S]*?^name:\s*(.+)$/m) ?? [])[1]?.trim() ?? null;
+        const description = (t.match(/^---[\s\S]*?^description:\s*(.+)$/m) ?? [])[1]?.trim() ?? null;
+        out.push({ dir: path.relative(root, path.dirname(p)), name: name ?? path.basename(path.dirname(p)), description, malformed: !name || !description });
+      }
+    }
+  };
+  await walk(root, 0);
+  return out.sort((a, b) => a.dir.localeCompare(b.dir));
+}
+
 // ---------- load suite ----------
 const manifest = JSON.parse(await fs.readFile(path.join(pluginDir, '.claude-plugin/plugin.json'), 'utf8'));
 const pluginName = manifest.name;
@@ -98,7 +153,7 @@ for (const d of (await fs.readdir(evalDir, { withFileTypes: true })).filter((e) 
   let scaffoldScript = null;
   const casePath = path.join(evalDir, d.name, 'case.yaml');
   if (existsSync(casePath)) { const m = (await fs.readFile(casePath, 'utf8')).match(/scaffold_script:\s*\|\s*\n((?:[ \t]+.*\n?)+)/); if (m) scaffoldScript = m[1].replace(/^[ \t]+/gm, ''); }
-  cases.push({ scaffoldScript, description: meta.description ?? null, dir: d.name, name: meta.name ?? d.name, tags: meta.tags ?? [], runs: opt.runs ?? meta.runs ?? 3, maxTurns: meta.max_turns ?? 10, timeout: (meta.timeout_seconds ?? 300) * 1000, allowedTools: meta.allowed_tools ?? [], model: opt.model ?? meta.model, prompt: body, graders });
+  cases.push({ scaffoldScript, description: meta.description ?? null, dir: d.name, name: meta.name ?? d.name, tags: meta.tags ?? [], covers: (await readCovers(path.join(evalDir, d.name))) ?? meta.covers ?? [], runs: opt.runs ?? track.runs ?? meta.runs ?? 3, maxTurns: meta.max_turns ?? 10, timeout: (meta.timeout_seconds ?? 300) * 1000, allowedTools: meta.allowed_tools ?? [], model: opt.model ?? meta.model ?? track.model, prompt: body, graders });
 }
 if (!cases.length) die('No eval cases found');
 function globToRe(g) { const alts = g.replace(/^\{(.*)\}$/, '$1').split(',').map((x) => x.trim()).filter(Boolean); return new RegExp('^(?:' + alts.map((a) => a.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*\*/g, '.*').replace(/\*/g, '[^/]*')).join('|') + ')$'); } // supports a,b and {a,b}
@@ -232,7 +287,8 @@ async function grade(g, run, arm, ablating) {
 
 // ---------- regrade support ----------
 const regradeSource = opt.regrade ? JSON.parse(await fs.readFile(opt.regrade, 'utf8')) : null;
-if (regradeSource && regradeSource.cases?.some((x) => x.arms?.without?.length)) opt.ablation = 'with-without';
+// regrade inherits the saved run's ablation mode — the CLI default must not decide which graders count
+if (regradeSource) opt.ablation = regradeSource.cases?.some((x) => x.arms?.without?.length) ? 'with-without' : 'none';
 function fromSaved(r) {
   const toolUses = (r.toolUses ?? []).map((u) => ({ tool: u.tool, input: (() => { try { return JSON.parse(u.input); } catch { return u.input; } })() }));
   // Saved runs from older runner versions flagged max_turns exits as errors. A run that made tool calls and
@@ -249,18 +305,34 @@ const arms = ablating ? ['with', 'without'] : ['with'];
 const stamp = new Date().toISOString().replace(/[:.]/g, '-');
 const outDir = opt.outputDir ?? path.join(evalDir, 'results', stamp);
 await fs.mkdir(outDir, { recursive: true });
-log(`eval-shim: ${pluginName} · ${cases.length} case(s) · arms=${arms.join(',')} · model=${opt.model} · judge=${opt.judgeModel}${opt.regrade ? ' · REGRADE of ' + path.basename(path.dirname(opt.regrade)) : ''}`);
-const report = { schemaVersion: '1', shim: true, startedAt: new Date().toISOString(), generatedAt: opt.regrade ? (regradeSource?.generatedAt ?? new Date().toISOString()) : new Date().toISOString(), regradedAt: opt.regrade ? new Date().toISOString() : undefined, regradeOf: opt.regrade ?? undefined, suite: { name: pluginName, caseCount: cases.length, baselineOnly: false }, cases: [], aggregates: {} };
-let totalCost = 0, erroredRuns = 0, truncatedRuns = 0, firstError = null;
+const modelLabel = opt.model ?? (new Set(cases.map((c) => c.model)).size === 1 ? cases[0].model : 'per-case');
+log(`eval-shim: ${pluginName} · ${cases.length} case(s) · arms=${arms.join(',')} · track=${track.track} · model=${modelLabel}${track.track === 'pinned' && !track.modelIsPinned && !opt.model ? ' (unpinned alias)' : ''} · claude-code=${harnessVersion ?? '?'} · judge=${opt.judgeModel}${opt.expand ? ` · expand-on-deviation=${opt.expand}` : ''}${opt.budget ? ` · budget=$${opt.budget}` : ''}${opt.regrade ? ' · REGRADE of ' + path.basename(path.dirname(opt.regrade)) : ''}`);
+const report = {
+  schemaVersion: '1.1', shim: true, agent, track: track.track,
+  harness: { name: 'claude-code', version: opt.regrade ? (regradeSource?.harness?.version ?? harnessVersion) : harnessVersion },
+  judge: { model: opt.judgeModel },
+  config: { model: modelLabel, modelIsPinned: opt.model ? true : track.modelIsPinned, harness: String(track.harness), harnessIsPinned: track.harnessIsPinned, expandOnDeviation: opt.expand || 0, budgetUsd: opt.budget, file: cdc._exists ? path.basename(cdc._path) : null },
+  startedAt: new Date().toISOString(), generatedAt: opt.regrade ? (regradeSource?.generatedAt ?? new Date().toISOString()) : new Date().toISOString(), regradedAt: opt.regrade ? new Date().toISOString() : undefined, regradeOf: opt.regrade ?? undefined,
+  suite: { name: pluginName, caseCount: cases.length, baselineOnly: false },
+  discovered: { skills: await discoverSkills(pluginDir) },
+  cases: [], aggregates: {},
+};
+let totalCost = 0, erroredRuns = 0, truncatedRuns = 0, firstError = null, budgetExceeded = false, skippedRuns = 0;
+const overBudget = () => opt.budget !== null && totalCost >= opt.budget;
 for (const c of cases) {
-  const entry = { name: c.name, dir: c.dir, tags: c.tags, description: c.description, prompt: c.prompt, scaffold: c.scaffoldScript, graders: c.graders.map((g) => ({ name: g.name, type: g.type, rubric: g.rubric, target: g.target ?? null, pattern: g.pattern ?? null, match: g.match ?? null, tool: g.tool ?? null, input_match: g.input_match ?? null, min: g.min ?? null, max: g.max ?? null, path: g.path ?? null, criteria: g.criteria ?? null, arm: g.arm ?? null })), arms: {}, summary: {} };
+  const entry = { name: c.name, dir: c.dir, tags: c.tags, covers: c.covers, description: c.description, prompt: c.prompt, scaffold: c.scaffoldScript, graders: c.graders.map((g) => ({ name: g.name, type: g.type, rubric: g.rubric, target: g.target ?? null, pattern: g.pattern ?? null, match: g.match ?? null, tool: g.tool ?? null, input_match: g.input_match ?? null, min: g.min ?? null, max: g.max ?? null, path: g.path ?? null, criteria: g.criteria ?? null, arm: g.arm ?? null })), arms: {}, summary: {} };
   for (const arm of arms) {
     entry.arms[arm] = [];
     const saved = opt.regrade ? (regradeSource.cases.find((x) => (x.dir ?? x.name) === c.dir)?.arms?.[arm] ?? []) : null;
     if (saved && !saved.length) { delete entry.arms[arm]; continue; }
     const nRuns = saved ? saved.length : c.runs;
-    for (let i = 0; i < nRuns; i++) {
-      log(`  ▸ ${c.dir} [${arm}] ${saved ? 'regrade' : 'run'} ${i + 1}/${nRuns} …`);
+    let target = nRuns, expanded = false;
+    for (let i = 0; i < target; i++) {
+      if (!saved && overBudget()) { // budget: never start a run past the cap; what already ran is kept and scored
+        if (!budgetExceeded) log(`  ■ budget: $${totalCost.toFixed(2)} spent ≥ $${opt.budget} cap — not starting more agent runs`);
+        budgetExceeded = true; skippedRuns += target - i; break;
+      }
+      log(`  ▸ ${c.dir} [${arm}] ${saved ? 'regrade' : 'run'} ${i + 1}/${target} …`);
       const run = saved ? fromSaved(saved[i]) : await runAgent(c, arm);
       const graders = [];
       for (const g of c.graders) {
@@ -275,6 +347,11 @@ for (const c of cases) {
       if (run.isError) log(`    ERROR (exit ${run.exitCode}): ${(run.lastMessage || run.stderr || run.rawTail || 'no output').trim().slice(0, 300)}`);
       if (run.truncated) { truncatedRuns++; log(`    TRUNCATED (${run.resultSubtype || 'exit ' + run.exitCode}, ${run.numTurns} turns): scored as-is — raise max_turns for this case`); }
       log(`    score=${fmt(score)}  ${graders.map((g) => `${g.verdict === 'pass' ? '✓' : g.verdict === 'fail' ? '✗' : '·'}${g.name}${g.scored ? '' : '(ind)'}`).join(' ')}`);
+      // sequential testing: the configured runs are the cheap first look; only a deviation buys more evidence
+      if (!saved && !expanded && opt.expand > 0 && i === nRuns - 1 && entry.arms[arm].some((r) => r.score !== 1)) {
+        expanded = true; target += opt.expand;
+        log(`    ↳ deviation in the first ${nRuns} run(s) — expanding by ${opt.expand} more`);
+      }
     }
   }
   if (opt.regrade && !Object.keys(entry.arms).length) { log(`  ▸ ${c.dir}: no saved runs in source — skipped`); continue; }
@@ -286,7 +363,9 @@ for (const c of cases) {
 }
 const withScores = report.cases.map((c) => c.summary.score).filter((s) => s !== null);
 const totalRuns = report.cases.reduce((n, c) => n + Object.values(c.arms).flat().length, 0);
-report.aggregates = { overallScore: withScores.length ? withScores.reduce((a, b) => a + b, 0) / withScores.length : null, passed: report.cases.filter((c) => c.summary.score === 1).length, failed: report.cases.filter((c) => c.summary.score !== null && c.summary.score !== 1).length, costUsd: totalCost, erroredRuns, truncatedRuns, totalRuns, partialReason: erroredRuns ? `${erroredRuns} of ${totalRuns} agent runs errored: ${firstError}` : null };
+const resolvedModels = [...new Set(report.cases.flatMap((c) => (c.arms.with ?? []).map((r) => r.model)).filter(Boolean))];
+report.aggregates = { overallScore: withScores.length ? withScores.reduce((a, b) => a + b, 0) / withScores.length : null, passed: report.cases.filter((c) => c.summary.score === 1).length, failed: report.cases.filter((c) => c.summary.score !== null && c.summary.score !== 1).length, costUsd: totalCost, erroredRuns, truncatedRuns, totalRuns, partialReason: erroredRuns ? `${erroredRuns} of ${totalRuns} agent runs errored: ${firstError}` : null, resolvedModels, budget: opt.budget !== null ? { capUsd: opt.budget, spentUsd: totalCost, exceeded: budgetExceeded, skippedRuns } : null };
+if (budgetExceeded) log(`\nBUDGET CAP: stopped after $${totalCost.toFixed(2)} (cap $${opt.budget}); ${skippedRuns} planned run(s) not started — cases without runs score as unknown, not as regressions`);
 if (!opt.regrade) report.generatedAt = new Date().toISOString(); // stamp at completion; startedAt keeps the start
 const outPath = path.join(outDir, 'aggregate-result.json');
 await fs.writeFile(outPath, JSON.stringify(report, null, 2));
