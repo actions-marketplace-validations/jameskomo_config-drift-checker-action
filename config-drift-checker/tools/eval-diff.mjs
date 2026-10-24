@@ -7,6 +7,8 @@
 //        [--fail-on score,turns,cost,duration]   which drifts turn the exit code red (default: score)
 //        [--history <dir>]   newest N (noise.history_runs, default 10) timestamped *.json results → per-case noise band
 //        [--report-url <url>]   case names in the markdown table link to <url>#case-<dir> (the run's HTML report)
+//        [--case <glob>]   the run evaluated only these cases (a PR selection from pr-impact.mjs): baseline cases
+//                          outside the glob are not compared and not "missing"; a matching one that is absent still is
 //
 // Score drift: a case dropped by more than --threshold, or a baseline case is missing → "regressed".
 // A drop past the threshold but inside the case's noise band (max−min of with-arm run scores across
@@ -19,14 +21,19 @@
 // flagged as likely refusals (a model guardrail change, not setup drift).
 // Efficiency drift: median turns / cost / duration of the with-arm moved by more than its threshold →
 // "slower" / "pricier" / "longer" — reported always, red only if listed in --fail-on.
+// How sure (information only, never changes a verdict): per case, a 95% range on the mean score
+// (3+ runs) and on the share of runs that passed, and the runs needed to catch a drop of the score
+// threshold 8 times in 10 at the spread seen across baseline, history and this run (eval-stats.mjs).
 // Exit 0: nothing red. Exit 1: red drift. Exit 2: every agent run errored (nothing to compare).
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { caseScore, withRuns, median, caseMap, resolveThresholds, loadHistory, classifyCase, baselineWarnings, normalizeResult } from './eval-classify.mjs';
+import { caseStats, fmtRange, fmtPass, shortLine, LEGEND } from './eval-stats.mjs';
+import { globToRe } from './cc-release.mjs';
 
 const argv = process.argv.slice(2);
 const files = [];
-const opt = { threshold: null, turns: null, cost: null, duration: null, failOn: null, md: null, json: null, config: null, history: null, reportUrl: null };
+const opt = { threshold: null, turns: null, cost: null, duration: null, failOn: null, md: null, json: null, config: null, history: null, reportUrl: null, case: null };
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--threshold') opt.threshold = Number(argv[++i]);
@@ -39,11 +46,16 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--json') opt.json = argv[++i];
   else if (a === '--history') opt.history = path.resolve(argv[++i]);
   else if (a === '--report-url') opt.reportUrl = argv[++i];
+  else if (a === '--case') opt.case = argv[++i];
   else if (!a.startsWith('--')) files.push(a);
   else { console.error(`unknown option ${a}`); process.exit(2); }
 }
 if (files.length !== 2) { console.error('usage: eval-diff.mjs <baseline.json> <current.json> [--threshold 0.15] [--config <plugin-dir>] [--fail-on score,turns] [--history dir] [--md out.md] [--json out.json]'); process.exit(2); }
 const [base, cur] = await Promise.all(files.map(async (f) => normalizeResult(JSON.parse(await fs.readFile(f, 'utf8')))));
+// a case selection: only what the run was asked to evaluate is compared
+const inSelection = opt.case ? ((re) => (c) => re.test(c.dir ?? c.name ?? ''))(globToRe(opt.case)) : () => true;
+const outside = (base.cases ?? []).filter((c) => !inSelection(c)).length;
+if (opt.case) { base.cases = (base.cases ?? []).filter(inSelection); cur.cases = (cur.cases ?? []).filter(inSelection); }
 
 // thresholds: flag > .cdc.yml > default; history: newest N same-track results, the current file excluded
 const { th, failOn, minBaselineRuns, historyRuns } = resolveThresholds(opt.config, cur.track, opt);
@@ -93,6 +105,14 @@ function efficiency(b, c) {
   return out;
 }
 
+// spread evidence per case: every history result, the baseline and this run, one group each. The
+// baseline is usually also stored in history and the no-baseline mode diffs a file with itself, so
+// count each result once.
+const sameRun = (x, y) => !!x.generatedAt && x.generatedAt === y.generatedAt;
+const selfDiff = path.resolve(files[0]) === path.resolve(files[1]) || sameRun(base, cur);
+const evidence = [...(history ?? []).filter((h) => !sameRun(h, base) && !sameRun(h, cur)).map(caseMap), ...(selfDiff ? [] : [caseMap(base)]), caseMap(cur)];
+const statsFor = (k, c) => caseStats(c, evidence.map((m) => m.get(k)), { drop: th.score, floor: minBaselineRuns });
+
 const rows = [];
 const baseMap = caseMap(base);
 const curMap = caseMap(cur);
@@ -104,9 +124,11 @@ for (const [k, b] of baseMap) {
   const { status, escalated, before, after, delta, noise, effThreshold } = classifyCase(k, b, c, histCases, th.score);
   const eff = efficiency(b, c);
   const flags = EFF.filter(([name]) => eff[name].drifted).map(([, , flag]) => flag);
-  rows.push({ case: k, status, escalated, before, after, delta, noise, effThreshold, historyRuns: nHist, warnings, refusedRuns: status === 'regressed' || status === 'noisy' ? refusedRuns(b, c, before) : 0, skillNote: status === 'regressed' ? skillNote(c) : null, runs: runs(c), baselineArm: baseline(c), failedGraders: failedGraders(c), eff, flags });
+  rows.push({ case: k, status, escalated, before, after, delta, noise, effThreshold, historyRuns: nHist, warnings, refusedRuns: status === 'regressed' || status === 'noisy' ? refusedRuns(b, c, before) : 0, skillNote: status === 'regressed' ? skillNote(c) : null, runs: runs(c), baselineArm: baseline(c), failedGraders: failedGraders(c), eff, flags, stats: statsFor(k, c) });
 }
-for (const [k, c] of curMap) if (!baseMap.has(k)) rows.push({ case: k, status: 'new', before: null, after: caseScore(c), delta: null, noise: null, effThreshold: th.score, historyRuns: nHist, warnings: [], runs: runs(c), baselineArm: baseline(c), failedGraders: failedGraders(c), flags: [] });
+for (const [k, c] of curMap) if (!baseMap.has(k)) rows.push({ case: k, status: 'new', before: null, after: caseScore(c), delta: null, noise: null, effThreshold: th.score, historyRuns: nHist, warnings: [], runs: runs(c), baselineArm: baseline(c), failedGraders: failedGraders(c), flags: [], stats: statsFor(k, c) });
+const short = rows.filter((r) => r.stats?.runsNeeded?.short);
+const runsNeeded = rows.filter((r) => r.stats?.runsNeeded).map((r) => ({ case: r.case, current: r.stats.runsNeeded.current, needed: r.stats.runsNeeded.needed, capped: r.stats.runsNeeded.capped, short: r.stats.runsNeeded.short, sd: r.stats.spread.sd, samples: r.stats.spread.samples }));
 
 const regressed = rows.filter((r) => r.status === 'regressed' || r.status === 'missing');
 const flagged = rows.filter((r) => r.flags.length);
@@ -154,12 +176,17 @@ const md = [
   ...(rows.some((r) => r.escalated) ? ['', rows.filter((r) => r.escalated).map((r) => `_\`${r.case}\` is within its ±${(r.noise ?? 0).toFixed(2)} noise band but red anyway: ${r.escalated}_`).join('\n')] : []),
   ...(rows.some((r) => r.refusedRuns) ? ['', rows.filter((r) => r.refusedRuns).map((r) => `_\`${r.case}\`: ${r.refusedRuns} of ${r.runs} run(s) look like refusals (≤1 turn, no tool use), likely a model guardrail change, not setup drift; read the run transcript before acting_`).join('\n')] : []),
   ...(rows.some((r) => r.skillNote) ? ['', rows.filter((r) => r.skillNote).map((r) => `_\`${r.case}\`: ${r.skillNote}_`).join('\n')] : []),
+  ...(rows.some((r) => r.stats) ? ['', '**How sure are these scores?** Information only: the verdicts above do not use these numbers.', '',
+    '| case | score, 95% range | runs passing, 95% range | runs needed |', '|---|---|---|---|',
+    ...rows.filter((r) => r.stats).map((r) => { const s = r.stats, rn = s.runsNeeded; return `| ${r.case} | ${fmtRange(s.score.mean, s.score)} | ${fmtPass(s.pass)} | ${rn ? `${rn.needed}${rn.capped ? '+' : ''}${rn.short ? ` (has ${rn.current}) ⚠` : ''}` : 'n/a'} |`; }),
+    '', `<sub>${LEGEND} Runs needed: runs per case to catch a ${th.score} score drop 8 times in 10 at the spread this case has shown${nHist ? ` over the last ${nHist} run${nHist === 1 ? '' : 's'}` : ''}.</sub>`,
+    ...(short.length ? ['', short.map((r) => `_${shortLine(`\`${r.case}\``, r.stats.runsNeeded, th.score)}_`).join('\n'), '', `_Set \`runs:\` in those cases' prompt.md, or write the suggestions with \`tools/runs-needed.mjs <history-dir> --config <plugin> --write\`._`] : [])] : []),
   ...(warned.length ? ['', `**⚠ baseline quality (never red):** ${warned.map((r) => `\`${r.case}\`, ${r.warnings.join(', ')}`).join(' · ')}. More runs per case fix this; never loosen the threshold.`] : []),
   '',
-  `<sub>baseline: ${base.generatedAt ?? files[0]} · current: ${cur.generatedAt ?? files[1]} · fail on: ${[...failOn].join(', ')} · efficiency thresholds: turns ${th.turns}, cost ${th.cost}, duration ${th.duration}</sub>`,
+  `<sub>${opt.case ? `case selection \`${opt.case}\`: ${outside} baseline case${outside === 1 ? '' : 's'} outside it not compared · ` : ''}baseline: ${base.generatedAt ?? files[0]} · current: ${cur.generatedAt ?? files[1]} · fail on: ${[...failOn].join(', ')} · efficiency thresholds: turns ${th.turns}, cost ${th.cost}, duration ${th.duration}</sub>`,
 ].join('\n');
 
 console.log(md);
 if (opt.md) await fs.writeFile(opt.md, md + '\n');
-if (opt.json) await fs.writeFile(opt.json, JSON.stringify({ regressed: regressed.length, red: red.length, flagged: flagged.length, thresholds: th, failOn: [...failOn], moved, worth, rows, overall: { before: base.aggregates?.overallScore ?? null, after: cur.aggregates?.overallScore ?? null }, harness: { before: base.harness?.version ?? null, after: cur.harness?.version ?? null }, models: { before: mb, after: mc } }, null, 2));
+if (opt.json) await fs.writeFile(opt.json, JSON.stringify({ regressed: regressed.length, red: red.length, flagged: flagged.length, thresholds: th, runsNeeded, failOn: [...failOn], moved, worth, rows, overall: { before: base.aggregates?.overallScore ?? null, after: cur.aggregates?.overallScore ?? null }, harness: { before: base.harness?.version ?? null, after: cur.harness?.version ?? null }, models: { before: mb, after: mc } }, null, 2));
 process.exit(allErrored ? 2 : red.length ? 1 : 0);

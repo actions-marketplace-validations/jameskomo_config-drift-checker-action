@@ -12,6 +12,7 @@ inputs:
   runs:                  { description: 'Runs per case (overrides case default and .cdc.yml)', default: '' }
   concurrency:           { description: 'Agent runs at once, 1 to 8. They share one rate limit, so this saves wall-clock time, not cost; 3 suits most CI suites. Passed as -j to the official runner when the installed Claude Code supports it (2.1.295+), and to the bundled runner always', default: '1' }
   model:                 { description: 'Agent model alias or id (overrides the track)', default: '' }
+  disallow-tools:        { description: 'Built-in tools to keep from Claude in every case, even when granted, space or comma separated (e.g. Agent TaskStop). Added to each case''s own disallowed_tools. Passed as --disallow-tools to the official runner when the installed Claude Code supports it (2.1.299+), and to the bundled runner always. Empty = none', default: '' }
   judge-model:           { description: 'LLM grader model (overrides .cdc.yml judge_model)', default: '' }
   ablation:              { description: 'with-without (baseline proof) or none (cheaper regression runs)', default: 'none' }
   scaffold:              { description: 'Run case.yaml scaffold_script (only for suites you authored)', default: 'true' }
@@ -28,6 +29,8 @@ inputs:
   github-token:          { description: 'Token for pushing results, opening PRs and commenting', default: '${{ github.token }}' }
   pages:                 { description: 'Also write docs/ (dashboard, report, latest.json) to the results branch for GitHub Pages (source: results branch, /docs)', default: 'true' }
   preflight:             { description: 'Static checks before any model run: the skill linter and the suite format doctor (including a free load check on the installed Claude Code). warn = report in the job summary; fail = stop before spending model runs; off', default: 'warn' }
+  pr-impact:             { description: 'On pull requests, post (and keep updated) one comment with what the PR changes in the agent setup: tokens added to every session, rules changed, the cases that test them, and changed rules no case tests. No model calls. true or false', default: 'true' }
+  pr-select:             { description: 'On pull requests, run only the cases that cover the rules the PR changed (falls back to the full suite when no case is selected). A selected run never becomes the baseline. true or false', default: 'false' }
 
 outputs:
   regressed:       { description: 'Number of regressed/missing cases', value: '${{ steps.diff.outputs.regressed }}' }
@@ -36,6 +39,8 @@ outputs:
   track:           { description: 'pinned or canary', value: '${{ steps.config.outputs.track }}' }
   skipped:         { description: 'true when the budget or interval gate skipped the run', value: '${{ steps.gate.outputs.skipped }}' }
   skip-reason:     { description: 'budget | interval | (empty)', value: '${{ steps.gate.outputs.skip_reason }}' }
+  floor:           { description: 'true when the gate skipped the agent runs and the free checks (preflight + context cost, $0) ran on the new Claude Code instead', value: '${{ steps.floor.outputs.ran }}' }
+  untested-version: { description: 'Claude Code version the skip left without a behaviour test (set when floor is true)', value: '${{ steps.floor.outputs.untested_version }}' }
   spent-month:     { description: 'USD spent this month on this suite after this run (from the ledger)', value: '${{ steps.store.outputs.spent_month }}' }
   runner:          { description: 'official or shim', value: '${{ steps.runner.outputs.runner }}' }
   claude-version:  { description: 'Claude Code version that was exercised', value: '${{ steps.install.outputs.version }}' }
@@ -57,8 +62,35 @@ runs:
         TRACK_INPUT: ${{ inputs.track }}
       run: |
         set -euo pipefail
-        tools="$ACTION_PATH/../config-drift-checker/tools"; echo "tools=$tools" >> "$GITHUB_OUTPUT"
+        tools="$ACTION_PATH/config-drift-checker/tools"; echo "tools=$tools" >> "$GITHUB_OUTPUT"
         node "$tools/cdc-config.mjs" "$PLUGIN_DIR" resolve ${TRACK_INPUT:+"$TRACK_INPUT"} --github-output | tee -a "$GITHUB_OUTPUT"
+
+    - id: pr-impact
+      # free: git and file reads only. What this PR changes in the agent setup, as one PR comment
+      if: github.event_name == 'pull_request' && inputs.pr-impact == 'true'
+      shell: bash
+      env:
+        TOOLS: ${{ steps.config.outputs.tools }}
+        PLUGIN_DIR: ${{ inputs.plugin-dir }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        SELECT: ${{ inputs.pr-select }}
+      run: |
+        set -uo pipefail
+        git fetch --no-tags -q --depth=200 origin "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || true
+        if ! node "$TOOLS/pr-impact.mjs" --base "$BASE_SHA" --head "$HEAD_SHA" --plugin "$PLUGIN_DIR" --md "$RUNNER_TEMP/pr-impact.md" --json "$RUNNER_TEMP/pr-impact.json" >/dev/null; then
+          echo "::notice::pr-impact could not compare this PR's setup; the full suite runs as usual"; echo "glob=" >> "$GITHUB_OUTPUT"; exit 0
+        fi
+        cat "$RUNNER_TEMP/pr-impact.md" >> "$GITHUB_STEP_SUMMARY"
+        glob=$(node -e 'const j=require(process.env.RUNNER_TEMP+"/pr-impact.json");console.log(/^[\w.*?-]+$/.test(j.glob??"")?j.glob:"")')
+        if [ "$SELECT" = "true" ] && [ -n "$glob" ]; then echo "glob=$glob" >> "$GITHUB_OUTPUT"; else echo "glob=" >> "$GITHUB_OUTPUT"; fi
+        body=$(node -e 'console.log(JSON.stringify({body:require("fs").readFileSync(process.env.RUNNER_TEMP+"/pr-impact.md","utf8")}))')
+        id=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate --jq '.[]|select(.body|startswith("<!-- cdc-pr-impact -->"))|.id' 2>/dev/null | head -n1)
+        if [ -n "$id" ]; then gh api -X PATCH "repos/$REPO/issues/comments/$id" --input - <<< "$body" >/dev/null || echo "::warning::could not update the PR impact comment"
+        else gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" --input - <<< "$body" >/dev/null || echo "::warning::could not post the PR impact comment (the token needs pull-requests: write)"; fi
 
     - id: coverage
       shell: bash
@@ -124,15 +156,36 @@ runs:
           { echo "## Agent-config eval: skipped"; echo; echo "$msg"; } >> "$GITHUB_STEP_SUMMARY"; echo "::notice::config-drift-checker: $msg"
         else echo "skipped=false" >> "$GITHUB_OUTPUT"; echo "skip_reason=" >> "$GITHUB_OUTPUT"; fi
 
-    - id: install
-      if: steps.gate.outputs.skipped != 'true'
+    - id: floor-plan
+      # The free floor: a skipped run still installs the new Claude Code and runs the $0 checks on it
+      # (preflight + context-cost), once per version, so a release the gate skipped is a visible gap
+      if: steps.gate.outputs.skipped == 'true' && inputs.preflight != 'off'
       shell: bash
       env:
         VERSION_INPUT: ${{ inputs.claude-code-version }}
         HARNESS: ${{ steps.config.outputs.harness }}
+        BRANCH: ${{ inputs.results-branch }}
+      run: |
+        set -uo pipefail
+        v="$VERSION_INPUT"; [ -n "$v" ] || v="$HARNESS"; [ -n "$v" ] && [ "$v" != "null" ] || v=latest
+        case "$v" in *[!A-Za-z0-9.-]*) echo "::notice::free checks skipped: claude-code-version '$v' is not a version"; echo "run=false" >> "$GITHUB_OUTPUT"; exit 0;; esac
+        exact=$(npm view "@anthropic-ai/claude-code@$v" version 2>/dev/null | tail -1)
+        if ! [[ "$exact" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "::notice::free checks skipped: could not resolve Claude Code '$v' to one version"; echo "run=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+        # once per version: a behaviour run or an earlier floor record on the results branch already covers it
+        seen=$( { git ls-tree --name-only "origin/$BRANCH" history/ history/floor/ 2>/dev/null || true; } | grep -F -e "-cc$exact-" -e "-cc$exact.json" | head -1)
+        if [ -n "$seen" ]; then echo "free checks already recorded for Claude Code $exact ($seen)"; echo "run=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+        echo "run=true" >> "$GITHUB_OUTPUT"; echo "version=$exact" >> "$GITHUB_OUTPUT"
+
+    - id: install
+      if: steps.gate.outputs.skipped != 'true' || steps.floor-plan.outputs.run == 'true'
+      shell: bash
+      env:
+        VERSION_INPUT: ${{ inputs.claude-code-version }}
+        HARNESS: ${{ steps.config.outputs.harness }}
+        FLOOR_VERSION: ${{ steps.floor-plan.outputs.version }}
       run: |
         set -euo pipefail
-        v="$VERSION_INPUT"; [ -n "$v" ] || v="$HARNESS"; [ -n "$v" ] && [ "$v" != "null" ] || v=latest
+        v="$FLOOR_VERSION"; [ -n "$v" ] || v="$VERSION_INPUT"; [ -n "$v" ] || v="$HARNESS"; [ -n "$v" ] && [ "$v" != "null" ] || v=latest
         case "$v" in *[!A-Za-z0-9.-]*) echo "::error::claude-code-version '$v' is not a version"; exit 1;; esac
         npm install -g "@anthropic-ai/claude-code@$v" >/dev/null
         # newer Claude Code refuses shell tools in plugin eval without an OS sandbox (bubblewrap on Linux)
@@ -153,7 +206,7 @@ runs:
     - id: preflight
       # free: no model runs. Catches skills that will not load or trigger, and eval cases the installed
       # Claude Code's runner will reject (format drift between releases), before a token is spent
-      if: steps.gate.outputs.skipped != 'true' && inputs.preflight != 'off'
+      if: (steps.gate.outputs.skipped != 'true' || steps.floor-plan.outputs.run == 'true') && inputs.preflight != 'off'
       shell: bash
       env:
         TOOLS: ${{ steps.config.outputs.tools }}
@@ -182,8 +235,9 @@ runs:
 
     - id: context-cost
       # free: no model runs, no credentials. The tokens this setup adds to every session on the installed
-      # Claude Code (its own `plugin details`, in a throwaway config), stored per release for the trend
-      if: steps.gate.outputs.skipped != 'true' && inputs.preflight != 'off'
+      # Claude Code (its own `plugin details`, in a throwaway config), stored per release for the trend.
+      # Runs after a failed preflight too: on a skipped run it is half of the free floor
+      if: ${{ !cancelled() && steps.install.outcome == 'success' && (steps.gate.outputs.skipped != 'true' || steps.floor-plan.outputs.run == 'true') && inputs.preflight != 'off' }}
       shell: bash
       env:
         TOOLS: ${{ steps.config.outputs.tools }}
@@ -192,10 +246,55 @@ runs:
         node "$TOOLS/context-cost.mjs" "$PLUGIN_DIR" --runner "$(command -v claude)" --store "$RUNNER_TEMP/context-cost" --md "$RUNNER_TEMP/context-cost.md" >/dev/null || echo "::notice::context-cost could not measure this setup"
         cat "$RUNNER_TEMP/context-cost.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 
+    - id: floor
+      # the free floor's record: one history/floor/<stamp>-cc<version>.json per version the gate skipped,
+      # with the preflight, the context cost and the skip reason. No agent runs, no credentials, $0
+      if: ${{ !cancelled() && steps.floor-plan.outputs.run == 'true' && steps.install.outcome == 'success' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        TOOLS: ${{ steps.config.outputs.tools }}
+        TRACK: ${{ steps.config.outputs.track }}
+        BRANCH: ${{ inputs.results-branch }}
+        CC_VERSION: ${{ steps.install.outputs.version }}
+        SKIP_REASON: ${{ steps.gate.outputs.skip_reason }}
+        SPENT: ${{ steps.gate.outputs.spent_month }}
+        CAP: ${{ steps.gate.outputs.cap_month }}
+        NEXT_ALLOWED: ${{ steps.gate.outputs.next_allowed }}
+        PAGES: ${{ inputs.pages }}
+        PLUGIN_DIR: ${{ inputs.plugin-dir }}
+        REPORT_BASE_URL: ${{ inputs.report-base-url }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        node "$TOOLS/floor-record.mjs" --version "$CC_VERSION" --reason "$SKIP_REASON" --track "$TRACK" --spent "${SPENT:-0}" --cap "${CAP:-0}" --next-allowed "${NEXT_ALLOWED:-none}" \
+          --skills "$RUNNER_TEMP/preflight-skills.json" --suite "$RUNNER_TEMP/preflight-suite.json" --context-cost "$RUNNER_TEMP/context-cost" \
+          --out "$RUNNER_TEMP/floor.json" --md "$RUNNER_TEMP/floor.md" > "$RUNNER_TEMP/floor.txt"
+        name=$(grep '^name=' "$RUNNER_TEMP/floor.txt" | cut -d= -f2-); summary=$(grep '^summary=' "$RUNNER_TEMP/floor.txt" | cut -d= -f2-)
+        { echo; cat "$RUNNER_TEMP/floor.md"; } >> "$GITHUB_STEP_SUMMARY"
+        echo "::warning::config-drift-checker: $summary"
+        echo "ran=true" >> "$GITHUB_OUTPUT"; echo "untested_version=$CC_VERSION" >> "$GITHUB_OUTPUT"
+        wt="$RUNNER_TEMP/floor-wt"
+        git fetch origin "$BRANCH" 2>/dev/null && git worktree add "$wt" "origin/$BRANCH" || { git worktree add --detach "$wt"; (cd "$wt" && git checkout --orphan "$BRANCH" && git rm -rfq . 2>/dev/null || true); }
+        cd "$wt"; mkdir -p history/floor history/context-cost
+        cp "$RUNNER_TEMP/floor.json" "history/floor/$name"
+        cp "$RUNNER_TEMP"/context-cost/*.json history/context-cost/ 2>/dev/null || true
+        # the published dashboard, badge and feed show the gap now, not at the next behaviour run
+        if [ "$PAGES" = "true" ] && [ -s docs/index.html ]; then
+          page_args=(); [ -n "$REPORT_BASE_URL" ] && page_args=(--page-url "${REPORT_BASE_URL%/history*}")
+          node "$TOOLS/eval-dashboard.mjs" history --baseline baseline.json --reports docs/history --out docs/index.html --title "$REPO" \
+            --spend spend.json --streak canary/streak.json --coverage coverage.json --config "$GITHUB_WORKSPACE/$PLUGIN_DIR" --repo-url "https://github.com/$REPO" --release-watch .release-watch.json "${page_args[@]}" >/dev/null || echo "::notice::could not refresh the dashboard"
+        fi
+        git -c user.name=config-drift-checker -c user.email=config-drift-checker@users.noreply.github.com add -A
+        git -c user.name=config-drift-checker -c user.email=config-drift-checker@users.noreply.github.com commit -qm "floor ${name%.json} ${TRACK} ($SKIP_REASON)" || true
+        git push -q origin "HEAD:$BRANCH"
+        cd "$GITHUB_WORKSPACE" && git worktree remove --force "$wt" || true
+
     - id: run
       if: steps.gate.outputs.skipped != 'true'
       shell: bash
       env:
+        CASE_GLOB: ${{ steps.pr-impact.outputs.glob }}
         ANTHROPIC_API_KEY: ${{ env.ANTHROPIC_API_KEY }}
         CLAUDE_CODE_OAUTH_TOKEN: ${{ env.CLAUDE_CODE_OAUTH_TOKEN }}
         TOOLS: ${{ steps.config.outputs.tools }}
@@ -211,8 +310,10 @@ runs:
         SCAFFOLD: ${{ inputs.scaffold }}
         ABLATION: ${{ inputs.ablation }}
         CONCURRENCY: ${{ inputs.concurrency }}
+        DISALLOW: ${{ inputs.disallow-tools }}
         BUDGET_PER_RUN: ${{ steps.config.outputs.budget_per_run_usd }}
       run: |
+        case_args=(); [ -n "$CASE_GLOB" ] && case_args=(--case "$CASE_GLOB")
         set -euo pipefail
         case "$CONCURRENCY" in [1-8]) ;; *) echo "::error::concurrency must be a whole number from 1 to 8, got '$CONCURRENCY'"; exit 1;; esac
         test -n "${ANTHROPIC_API_KEY:-}${CLAUDE_CODE_OAUTH_TOKEN:-}" || { echo "::error::Neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set (BYOK: agent runs bill to your key or your subscription)"; exit 1; }
@@ -222,15 +323,24 @@ runs:
         runs_args=(); [ -n "$RUNS_INPUT" ] && runs_args=(--runs "$RUNS_INPUT")
         scaffold_args=(); [ "$SCAFFOLD" = "true" ] && scaffold_args=(--scaffold)
         shim_conc_args=(--concurrency "$CONCURRENCY")
+        # disallow-tools: bare built-in tool names, space or comma separated, kept from Claude in every case
+        case "$DISALLOW" in *[!A-Za-z0-9_,\ ]*) echo "::error::disallow-tools takes bare built-in tool names such as Agent TaskStop, got '$DISALLOW'"; exit 1;; esac
+        read -ra off <<< "${DISALLOW//,/ }"
+        shim_off_args=(); [ ${#off[@]} -gt 0 ] && shim_off_args=(--disallow-tools "${off[@]}")
         if [ "$RUNNER" = "official" ]; then
-          # -j arrived in Claude Code 2.1.295: probe the installed runner's help (free) rather than trust a version compare
-          conc_args=()
+          # -j arrived in Claude Code 2.1.295 and --disallow-tools in 2.1.299: probe the installed runner's help (free)
+          # rather than trust a version compare
+          conc_args=(); off_args=()
           runner_help=$(claude plugin eval --help 2>&1 || true)
           if grep -q -- '--concurrency' <<< "$runner_help"; then conc_args=(-j "$CONCURRENCY")
           elif [ "$CONCURRENCY" != "1" ]; then echo "::notice::Claude Code $CC_VERSION's plugin eval has no --concurrency; runs go one at a time"; fi
+          if [ ${#off[@]} -gt 0 ]; then
+            if grep -q -- '--disallow-tools' <<< "$runner_help"; then off_args=(--disallow-tools "${off[@]}")
+            else echo "::warning::Claude Code $CC_VERSION's plugin eval has no --disallow-tools (it arrived in 2.1.299), so ${off[*]} stay available to Claude in this run"; fi
+          fi
           # --trust-plugin: CI cannot answer the first-run trust prompt; the suite is this repo's own checkout
-          claude plugin eval "$PLUGIN_DIR" --ablation "$ABLATION" --model "$model" --judge-model "$judge" \
-            "${runs_args[@]}" "${scaffold_args[@]}" "${conc_args[@]}" --allow-tools Bash Write Edit --no-publish --trust-plugin --json "$out/aggregate-result.json" || true
+          claude plugin eval "$PLUGIN_DIR" "${case_args[@]}" --ablation "$ABLATION" --model "$model" --judge-model "$judge" \
+            "${runs_args[@]}" "${scaffold_args[@]}" "${conc_args[@]}" "${off_args[@]}" --allow-tools Bash Write Edit --no-publish --trust-plugin --json "$out/aggregate-result.json" || true
           # a CLI change in the official runner must never take the whole check down: if its result
           # is not a usable measurement (nothing written, every run refused, cases rejected), fall back
           expect=$(PLUGIN_DIR="$PLUGIN_DIR" node -e 'const fs=require("fs"),p=require("path");let d="evals";try{d=JSON.parse(fs.readFileSync(p.join(process.env.PLUGIN_DIR,".claude-plugin/plugin.json"),"utf8")).experimental?.evals||d}catch{};const e=p.join(process.env.PLUGIN_DIR,d);console.log(fs.existsSync(e)?fs.readdirSync(e,{withFileTypes:true}).filter(x=>x.isDirectory()&&!["results","mocks"].includes(x.name)).length:0)')
@@ -240,15 +350,15 @@ runs:
             echo "::warning::the official runner on Claude Code $CC_VERSION gave no usable result ($reason); falling back to the bundled runner for this run"
             rm -f "$out/aggregate-result.json"
             RUNNER=shim
-            node "$TOOLS/eval-shim.mjs" "$PLUGIN_DIR" --ablation "$ABLATION" --track "$TRACK" \
-              --model "$model" --judge-model "$judge" --budget "$BUDGET_PER_RUN" "${runs_args[@]}" "${scaffold_args[@]}" "${shim_conc_args[@]}" --output-dir "$out" || true
+            node "$TOOLS/eval-shim.mjs" "$PLUGIN_DIR" "${case_args[@]}" --ablation "$ABLATION" --track "$TRACK" \
+              --model "$model" --judge-model "$judge" --budget "$BUDGET_PER_RUN" "${runs_args[@]}" "${scaffold_args[@]}" "${shim_conc_args[@]}" "${shim_off_args[@]}" --output-dir "$out" || true
           fi
           # the official runner does not know tracks yet: stamp provenance so diff/store/promote can reason about it
           OUT_DIR="$out" JUDGE="$judge" node -e 'const fs=require("fs");const p=process.env.OUT_DIR+"/aggregate-result.json";if(fs.existsSync(p)){const j=JSON.parse(fs.readFileSync(p,"utf8"));j.track=j.track||process.env.TRACK;j.harness=j.harness||{name:"claude-code",version:process.env.CC_VERSION};j.judge=j.judge||{model:process.env.JUDGE};fs.writeFileSync(p,JSON.stringify(j,null,2));}'
         else
           model_args=(); [ -n "$MODEL_INPUT" ] && model_args=(--model "$MODEL_INPUT")
-          node "$TOOLS/eval-shim.mjs" "$PLUGIN_DIR" --ablation "$ABLATION" --track "$TRACK" \
-            "${model_args[@]}" --judge-model "$judge" --budget "$BUDGET_PER_RUN" "${runs_args[@]}" "${scaffold_args[@]}" "${shim_conc_args[@]}" --output-dir "$out" || true
+          node "$TOOLS/eval-shim.mjs" "$PLUGIN_DIR" "${case_args[@]}" --ablation "$ABLATION" --track "$TRACK" \
+            "${model_args[@]}" --judge-model "$judge" --budget "$BUDGET_PER_RUN" "${runs_args[@]}" "${scaffold_args[@]}" "${shim_conc_args[@]}" "${shim_off_args[@]}" --output-dir "$out" || true
         fi
         test -s "$out/aggregate-result.json" || { echo "::error::eval produced no aggregate-result.json"; exit 1; }
         # carry the preflight (skill lint + suite format) inside the result, so every stored run has its
@@ -266,6 +376,7 @@ runs:
       if: steps.gate.outputs.skipped != 'true'
       shell: bash
       env:
+        CASE_GLOB: ${{ steps.pr-impact.outputs.glob }}
         TOOLS: ${{ steps.config.outputs.tools }}
         PLUGIN_DIR: ${{ inputs.plugin-dir }}
         RESULTS_DIR: ${{ steps.results.outputs.dir }}
@@ -284,10 +395,11 @@ runs:
       run: |
         set +e
         thr_args=(); [ -n "$THRESHOLD_INPUT" ] && thr_args=(--threshold "$THRESHOLD_INPUT")
+        case_args=(); [ -n "$CASE_GLOB" ] && case_args=(--case "$CASE_GLOB")
         hist_args=(); [ -n "$(ls -A "$RESULTS_DIR/history" 2>/dev/null)" ] && hist_args=(--history "$RESULTS_DIR/history")
         url_args=(); [ -n "$REPORT_BASE_URL" ] && url_args=(--report-url "${REPORT_BASE_URL%/}/$STEM.html")
         if [ "$ERRORED" != "true" ] && [ "$BASELINE_EXISTS" = "true" ] && ! { [ "$PROMOTE" = "true" ] && [ "$TRACK" = "pinned" ]; }; then
-          node "$TOOLS/eval-diff.mjs" "$RESULTS_DIR/baseline.json" "$RESULT" --config "$PLUGIN_DIR" "${thr_args[@]}" "${hist_args[@]}" "${url_args[@]}" --md "$RUNNER_TEMP/diff.md" --json "$RUNNER_TEMP/diff.json"
+          node "$TOOLS/eval-diff.mjs" "$RESULTS_DIR/baseline.json" "$RESULT" --config "$PLUGIN_DIR" "${case_args[@]}" "${thr_args[@]}" "${hist_args[@]}" "${url_args[@]}" --md "$RUNNER_TEMP/diff.md" --json "$RUNNER_TEMP/diff.json"
           node -e 'const d=require(process.env.RUNNER_TEMP+"/diff.json"); console.log("regressed="+d.regressed+"\nred="+d.red+"\nflagged="+d.flagged)' >> "$GITHUB_OUTPUT"
         else
           node "$TOOLS/eval-diff.mjs" "$RESULT" "$RESULT" --config "$PLUGIN_DIR" "${url_args[@]}" --md "$RUNNER_TEMP/diff.md" >/dev/null
@@ -336,6 +448,7 @@ runs:
       if: steps.gate.outputs.skipped != 'true' && steps.run.outputs.errored != 'true'
       shell: bash
       env:
+        CASE_GLOB: ${{ steps.pr-impact.outputs.glob }}
         GH_TOKEN: ${{ inputs.github-token }}
         ANTHROPIC_API_KEY: ${{ env.ANTHROPIC_API_KEY }}
         CDC_MODELS_API_KEY: ${{ env.CDC_MODELS_API_KEY }}   # API key for the free /v1/models listing when agent runs use a subscription token
@@ -365,7 +478,7 @@ runs:
         # context-cost measurements accumulate per release; the dashboard reads history/context-cost
         mkdir -p history/context-cost && cp "$RUNNER_TEMP"/context-cost/*.json history/context-cost/ 2>/dev/null || true
         if [ "$TRACK" = "pinned" ]; then
-          if [ "$BASELINE_EXISTS" != "true" ] || [ "$PROMOTE" = "true" ]; then
+          if [ -z "$CASE_GLOB" ] && { [ "$BASELINE_EXISTS" != "true" ] || [ "$PROMOTE" = "true" ]; }; then
             if node "$TOOLS/baseline-check.mjs" "$RESULT" --config "$GITHUB_WORKSPACE/$PLUGIN_DIR"; then
               cp "$RESULT" baseline.json
             else
@@ -393,7 +506,7 @@ runs:
           [ -s canary/streak.json ] && cp canary/streak.json docs/streak.json || true
           page_args=(); [ -n "$REPORT_BASE_URL" ] && page_args=(--page-url "${REPORT_BASE_URL%/history*}")
           node "$TOOLS/eval-dashboard.mjs" history --baseline baseline.json --reports docs/history --out docs/index.html --title "$REPO" \
-            --spend spend.json --streak canary/streak.json --coverage coverage.json --config "$GITHUB_WORKSPACE/$PLUGIN_DIR" --repo-url "https://github.com/$REPO" "${page_args[@]}" >/dev/null
+            --spend spend.json --streak canary/streak.json --coverage coverage.json --config "$GITHUB_WORKSPACE/$PLUGIN_DIR" --repo-url "https://github.com/$REPO" --release-watch .release-watch.json "${page_args[@]}" >/dev/null
           touch docs/.nojekyll
           echo "dashboard: docs/index.html (enable GitHub Pages: source = branch $BRANCH, folder /docs)" >> "$GITHUB_STEP_SUMMARY"
         fi
@@ -454,7 +567,7 @@ runs:
         RUN_ID: ${{ github.run_id }}
       run: |
         set +e
-        plugin="$ACTION_PATH/../config-drift-checker"
+        plugin="$ACTION_PATH/config-drift-checker"
         remaining=$(node -e 'console.log(Math.max(0, Math.min(2, Number(process.env.BUDGET_MONTH||0) - Number(process.env.SPENT_MONTH||0))))')
         if [ "$(REM="$remaining" node -e 'console.log(Number(process.env.REM) <= 0.2)')" = "true" ]; then echo "::notice::repair skipped: under \$0.20 of monthly budget left"; exit 0; fi
         branch="cdc/repair-$RUN_ID"; wt="$RUNNER_TEMP/repair-wt"; git worktree add -B "$branch" "$wt" HEAD
