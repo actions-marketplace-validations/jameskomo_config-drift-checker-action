@@ -1,0 +1,27 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "config-drift-checker",
+  "version": "1.6.3",
+  "description": "CI for your coding-agent setup (CLAUDE.md, skills, hooks): eval cases generated from your real configuration, re-run on every Claude Code release against a pinned baseline, with self-diagnosing reports and autonomous repair. One suite, three agents: Claude Code first-class, Codex and Gemini experimental.",
+  "author": {
+    "name": "James Komo",
+    "email": "james.komoh@gmail.com"
+  },
+  "homepage": "https://github.com/jameskomo/config-drift-checker",
+  "repository": "https://github.com/jameskomo/config-drift-checker",
+  "license": "FSL-1.1-Apache-2.0",
+  "keywords": [
+    "evals",
+    "regression",
+    "ci",
+    "hooks",
+    "skills",
+    "plugin-eval"
+  ],
+  "skills": [
+    "./skills/setup",
+    "./skills/run",
+    "./skills/write-case",
+    "./skills/repair"
+  ]
+}

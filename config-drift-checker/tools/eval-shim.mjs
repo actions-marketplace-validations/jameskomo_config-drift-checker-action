@@ -1,0 +1,647 @@
+#!/usr/bin/env node
+// eval-shim — runs a `claude plugin eval` suite (evals/<case>/prompt.md + graders/*.md)
+// without the early-access gate, by driving `claude -p` directly.
+//
+//   node tools/eval-shim.mjs <plugin-dir> [--case <glob>] [--runs n] [--model m]
+//        [--judge-model m] [--ablation none|with-without] [--json <path>]
+//        [--track pinned|canary]        which .cdc.yml track to run (model/harness/runs/budget come from there)
+//        [--expand-on-deviation n]      sequential testing: after the configured runs, add n more if any run deviated
+//        [--budget <usd>]               stop starting new agent runs once this much has been spent in this invocation
+//        [--concurrency n | -j n]       run up to n agent runs at once (1-8, default 1); results keep case and run order
+//        [--mocks record|off] [--allow-real-servers]   MCP mocks from <eval dir>/mocks/ (official format, default record)
+//        [--disallow-tools <tools...>]  built-in tools kept from Claude in every case, added to each case's own
+//                                       disallowed_tools (prompt.md, or execution: in case.yaml), as in the official runner
+//        [--output-dir <dir>] [--eval-dir <dir>] [--scaffold] [--no-isolate] [--no-safety-net] [--verbose]
+//        [--regrade <aggregate-result.json>] [--regrade-llm]   re-score saved runs with the current graders (no agent calls;
+//                                                          llm graders keep their saved verdict unless --regrade-llm)
+//
+// Precedence for model / judge / runs: CLI flag > case frontmatter (model only) > .cdc.yml track > built-in default.
+//
+// Safety net: every run (both arms) gets a PreToolUse hook (tools/safety-net.mjs) that blocks host-global
+// destructive commands (docker compose down -v, prune, git push --force, rm -rf outside ws, DROP DATABASE…).
+// Cases that must run such a command stub the binary in <ws>/.eval-bin/ from scaffold_script.
+//
+// Output: <plugin>/evals/results/<timestamp>/aggregate-result.json (official v1 shape, plus shim:true).
+// Supported graders: regex, tool_used, file_exists, llm (targets include mock_calls). tool_order/baseline are recorded as skipped.
+//
+// MCP mocks (--mocks record, the default, as in the official runner): the plugin's real MCP servers are not
+// started (--allow-real-servers keeps the unmocked ones), and each mocks/<server>/ dir is served by
+// tools/eval-mock-server.mjs under the server's own name. type: fixed mocks with expect:, error: and
+// {{input.x}} / {{file:...}} substitutions are supported; a case that needs a type: agent mock or
+// _server.md is recorded as unsupported (needs the official runner), never as a fail.
+import { spawn, execFileSync } from 'node:child_process';
+import { promises as fs, existsSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { renderReport } from './eval-report.mjs';
+import { loadConfig, resolveTrack } from './cdc-config.mjs';
+import { globToRe } from './cc-release.mjs';
+import { ABORT_PREFIX, declaredServers, loadMocks, planMocks } from './eval-mocks.mjs';
+import { executionEntries, BARE_TOOL } from './suite-doctor.mjs';
+
+// ---------- args ----------
+const argv = process.argv.slice(2);
+const opt = { case: null, runs: null, model: null, judgeModel: null, ablation: 'with-without', json: null, outputDir: null, isolate: true, verbose: false, scaffold: false, evalDir: null, safetyNet: true, regrade: null, regradeLlm: false, track: null, expand: null, budget: null, agent: null, concurrency: 1, mocks: 'record', allowRealServers: false, disallowTools: [] };
+let pluginDir = null;
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i], next = () => argv[++i];
+  if (a === '--case') opt.case = next();
+  else if (a === '--runs') opt.runs = Number(next());
+  else if (a === '--model') opt.model = next();
+  else if (a === '--judge-model') opt.judgeModel = next();
+  else if (a === '--ablation') opt.ablation = next();
+  else if (a === '--track') opt.track = next();
+  else if (a === '--expand-on-deviation') opt.expand = Number(next());
+  else if (a === '--budget') opt.budget = Number(next());
+  else if (a === '--agent') opt.agent = next();
+  else if (a === '--concurrency' || a === '-j') opt.concurrency = Number(next());
+  else if (a === '--mocks') opt.mocks = next();
+  else if (a === '--allow-real-servers') opt.allowRealServers = true;
+  // variadic like the official flag; a path (it has a / or a .) ends the list, so the plugin dir may follow it
+  else if (a === '--disallow-tools') { while (argv[i + 1] !== undefined && !/^-|[/.]/.test(argv[i + 1])) opt.disallowTools.push(...next().split(',').filter(Boolean)); }
+  else if (a === '--json') opt.json = argv[i + 1] && !argv[i + 1].startsWith('--') ? next() : '-';
+  else if (a === '--output-dir') opt.outputDir = next();
+  else if (a === '--no-isolate') opt.isolate = false;
+  else if (a === '--scaffold') opt.scaffold = true;
+  else if (a === '--eval-dir') opt.evalDir = next();
+  else if (a === '--no-safety-net') opt.safetyNet = false;
+  else if (a === '--regrade') opt.regrade = path.resolve(next());
+  else if (a === '--regrade-llm') opt.regradeLlm = true;
+  else if (a === '--verbose') opt.verbose = true;
+  else if (!a.startsWith('--')) pluginDir = path.resolve(a);
+  else die(`unknown option ${a}`);
+}
+if (!pluginDir) die('usage: eval-shim.mjs <plugin-dir> [options]');
+if (!Number.isInteger(opt.concurrency) || opt.concurrency < 1 || opt.concurrency > 8) die('--concurrency must be a whole number from 1 to 8');
+if (!['record', 'off'].includes(opt.mocks)) die(`--mocks must be record or off, not ${opt.mocks}`);
+// disallowed_tools takes bare built-in tool names only; the official runner refuses anything else with this message
+const notDisallowable = (bad) => `${bad.join(', ')} cannot be disallowed: ${bad.length === 1 ? 'it is not a built-in tool' : 'they are not built-in tools'}. Use bare names such as Agent or TaskStop; patterns such as Bash(rm:*) and MCP tools are not accepted.`;
+{ const bad = opt.disallowTools.filter((t) => !BARE_TOOL.test(t)); if (bad.length) die(`--disallow-tools: ${notDisallowable(bad)} No case was run.`); }
+function die(m) { console.error(m); process.exit(1); }
+const log = (...m) => { if (opt.json !== '-') console.error(...m); };
+
+// ---------- track: what this run pins and what it lets float (.cdc.yml) ----------
+const cdc = loadConfig(pluginDir);
+let track;
+try { track = resolveTrack(cdc, opt.track ?? cdc.track); } catch (e) { die(e.message); }
+const agent = opt.agent ?? track.agent ?? 'claude';
+if (!['claude', 'codex', 'gemini'].includes(agent)) { die(`unknown agent '${agent}' (claude | codex | gemini)`); }
+opt.judgeModel ??= track.judgeModel;
+opt.expand ??= track.expandOnDeviation;
+opt.budget ??= track.budget.per_run_usd;
+if (opt.budget !== null && !(opt.budget > 0)) opt.budget = null; // 0 or negative = no cap
+const harnessVersion = (() => { try { return execFileSync('claude', ['--version'], { encoding: 'utf8', timeout: 20_000 }).trim().split(/\s+/)[0] || null; } catch { return null; } })();
+
+// ---------- tiny YAML-subset frontmatter parser ----------
+function parseFrontmatter(src) {
+  const m = src.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+  if (!m) return { meta: {}, body: src.trim() };
+  const meta = {};
+  const lines = m[1].split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const kv = line.match(/^([\w-]+):\s*(.*)$/);
+    if (!kv) continue;
+    let [, k, v] = kv;
+    if (v === '' && /^\s+-\s/.test(lines[i + 1] ?? '')) { // block list (tags:\n  - a)
+      const buf = [];
+      while (i + 1 < lines.length && /^\s+-\s/.test(lines[i + 1])) buf.push(parseScalar(lines[++i].replace(/^\s+-\s*/, '')));
+      meta[k] = buf;
+      continue;
+    }
+    if (v === '|' || v === '>') { // block scalar
+      const buf = [];
+      while (i + 1 < lines.length && /^\s+/.test(lines[i + 1])) buf.push(lines[++i].replace(/^\s{2}/, ''));
+      meta[k] = buf.join(v === '|' ? '\n' : ' ');
+      continue;
+    }
+    meta[k] = parseScalar(v);
+  }
+  return { meta, body: m[2].trim() };
+}
+function parseScalar(v) {
+  v = v.trim();
+  if (v === '') return '';
+  if (/^\[.*\]$/.test(v)) return v.slice(1, -1).split(',').map((s) => parseScalar(s)).filter((s) => s !== '');
+  if (/^(['"]).*\1$/.test(v)) return v.slice(1, -1);
+  if (v === 'true') return true; if (v === 'false') return false;
+  if (/^-?\d+(\.\d+)?$/.test(v)) return Number(v);
+  return v;
+}
+
+// covers.yaml sidecar: rule ids a case exercises. Lives next to prompt.md because the official
+// runner rejects unknown frontmatter keys (a bare `covers:` in prompt.md fails to load there).
+async function readCovers(caseDir) {
+  const p = path.join(caseDir, 'covers.yaml');
+  if (!existsSync(p)) return null;
+  const t = (await fs.readFile(p, 'utf8')).replace(/#[^\n]*/g, '');
+  const b = t.match(/\[([^\]]*)\]/);
+  const items = b ? b[1].split(',') : [...t.matchAll(/^\s*-\s*(.+)$/gm)].map((m) => m[1]);
+  return items.map((s) => s.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
+}
+
+// What the agent could see at plugin load: every SKILL.md under the plugin that parses. A red
+// trigger case then splits into "discovered but never invoked" (suspect the trigger description)
+// vs "not discovered at all" (packaging: renamed dir, missing or malformed SKILL.md).
+async function discoverSkills(root) {
+  const out = [];
+  const walk = async (dir, depth) => {
+    if (depth > 6) return;
+    for (const e of await fs.readdir(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) { if (!['node_modules', '.git', 'results', 'evals', 'target', 'dist'].includes(e.name)) await walk(p, depth + 1); }
+      else if (e.name === 'SKILL.md') {
+        const t = await fs.readFile(p, 'utf8');
+        const name = (t.match(/^---[\s\S]*?^name:\s*(.+)$/m) ?? [])[1]?.trim() ?? null;
+        const description = (t.match(/^---[\s\S]*?^description:\s*(.+)$/m) ?? [])[1]?.trim() ?? null;
+        // an unquoted ': ' in a plain scalar is invalid strict YAML (issue #14): flag it, since
+        // linters, indexers and other agents' loaders reject the whole frontmatter over it
+        const strictInvalid = [name, description].some((v) => v && !/^["'>|]/.test(v) && v.includes(': '));
+        out.push({ dir: path.relative(root, path.dirname(p)), name: name ?? path.basename(path.dirname(p)), description, malformed: !name || !description || strictInvalid });
+      }
+    }
+  };
+  await walk(root, 0);
+  return out.sort((a, b) => a.dir.localeCompare(b.dir));
+}
+
+// ---------- load suite ----------
+const manifest = JSON.parse(await fs.readFile(path.join(pluginDir, '.claude-plugin/plugin.json'), 'utf8'));
+const pluginName = manifest.name;
+const evalDir = path.join(pluginDir, opt.evalDir ?? manifest.experimental?.evals ?? 'evals');
+if (!existsSync(evalDir)) die(`no eval dir at ${evalDir} (flag --eval-dir, manifest experimental.evals, or evals/)`);
+const cases = [];
+for (const d of (await fs.readdir(evalDir, { withFileTypes: true })).filter((e) => e.isDirectory() && !['results', 'mocks'].includes(e.name))) {
+  const promptPath = path.join(evalDir, d.name, 'prompt.md');
+  if (!existsSync(promptPath)) continue;
+  if (opt.case && !globToRe(opt.case).test(d.name)) continue;
+  const { meta, body } = parseFrontmatter(await fs.readFile(promptPath, 'utf8'));
+  const graders = [];
+  const gdir = path.join(evalDir, d.name, 'graders');
+  if (existsSync(gdir)) for (const g of (await fs.readdir(gdir)).filter((f) => f.endsWith('.md')).sort()) {
+    const { meta: gm, body: gb } = parseFrontmatter(await fs.readFile(path.join(gdir, g), 'utf8'));
+    graders.push({ name: g.replace(/\.md$/, ''), rubric: gb, ...gm });
+  }
+  let scaffoldScript = null, scaffoldPath = null, yamlDisallowed;
+  const casePath = path.join(evalDir, d.name, 'case.yaml');
+  if (existsSync(casePath)) {
+    const cy = await fs.readFile(casePath, 'utf8');
+    const dx = executionEntries(cy.split(/\r?\n/)).find((e) => e.key === 'disallowed_tools');
+    if (dx) yamlDisallowed = dx.value;
+    const file = cy.match(/scaffold_script:[ \t]*["']?([^\s"'|>]+\.(?:sh|bash))["']?[ \t]*$/m);
+    const inline = cy.match(/scaffold_script:\s*\|\s*\n((?:[ \t]+.*\n?)+)/);
+    if (file) {
+      const sp = path.join(evalDir, d.name, file[1]);
+      if (existsSync(sp)) { scaffoldScript = await fs.readFile(sp, 'utf8'); scaffoldPath = sp; }
+      else log(`  ${d.name}: case.yaml names scaffold_script ${file[1]}, which does not exist`);
+    } else if (inline) {
+      scaffoldScript = inline[1].replace(/^[ \t]+/gm, '');
+      log(`  ${d.name}: inline scaffold_script is the old form; claude plugin eval now wants a script file (context.scaffold_script: scaffold.sh)`);
+    }
+  }
+  // disallowed_tools from prompt.md and case.yaml's execution: (merged, as the official runner does), plus
+  // --disallow-tools; a declaration the official runner would refuse stops the case loading here too
+  const declaredOff = [meta.disallowed_tools, yamlDisallowed].filter((v) => v !== undefined);
+  const caseOff = declaredOff.filter(Array.isArray).flat().map(String);
+  const badOff = caseOff.filter((t) => !BARE_TOOL.test(t));
+  const offError = declaredOff.some((v) => !Array.isArray(v)) ? 'disallowed_tools: expected a list of tool names, got a single value'
+    : badOff.length ? `disallowed_tools: ${notDisallowable(badOff)}` : null;
+  cases.push({ ...(offError && { loadError: offError }), disallowedTools: [...new Set([...caseOff, ...opt.disallowTools])], scaffoldScript, scaffoldPath, description: meta.description ?? null, dir: d.name, name: meta.name ?? d.name, tags: meta.tags ?? [], covers: (await readCovers(path.join(evalDir, d.name))) ?? meta.covers ?? [], runs: opt.runs ?? track.runs ?? meta.runs ?? 3, maxTurns: meta.max_turns ?? 10, timeout: (meta.timeout_seconds ?? 300) * 1000, allowedTools: meta.allowed_tools ?? [], model: opt.model ?? meta.model ?? track.model, prompt: body, graders });
+}
+if (!cases.length) die('No eval cases found');
+
+// ---------- MCP mocks: what each case registers, and which plugin servers stay down ----------
+const declared = declaredServers(pluginDir);
+const pluginHasServers = Object.keys(declared.servers).length > 0;
+if (opt.mocks === 'record' && !opt.allowRealServers && declared.unenumerable.length) die(`mocks: plugin ${pluginName} declares MCP servers through an MCPB bundle (${declared.unenumerable.join(', ')}); record mode cannot withhold a server it cannot enumerate. Pass --allow-real-servers or --mocks off`);
+for (const c of cases) {
+  c.mockPlan = [];
+  if (opt.mocks !== 'record') continue;
+  const { servers, problems } = loadMocks(evalDir, path.join(evalDir, c.dir));
+  const errors = problems.filter((p) => p.level === 'ERROR');
+  if (errors.length) { c.loadError = `mocks: ${errors.slice(0, 3).map((p) => `${p.file}: ${p.message}`).join('; ')}${errors.length > 3 ? ` (+${errors.length - 3} more)` : ''}`; continue; }
+  c.mockPlan = planMocks(servers, pluginName, declared.servers).filter((p) => p.tools.size > 0);
+  const agentMocked = c.mockPlan.flatMap((p) => [...p.tools].filter(([, kind]) => kind === 'agent').map(([t]) => `${p.dir}/${t}`));
+  if (agentMocked.length) c.unsupported = `needs the official runner: ${agentMocked.join(', ')} ${agentMocked.length > 1 ? 'are' : 'is'} answered by a type: agent mock (the judge model acting as the server), which the shim does not emulate`;
+  else if (c.mockPlan.length && agent !== 'claude') c.unsupported = `needs the claude agent: MCP mocks are served to Claude Code only, not to ${agent}`;
+  c.mockCallsWithOnly = c.mockPlan.length > 0 && c.mockPlan.every((p) => p.shadow);
+}
+
+// The plugin as the with arm loads it in record mode: the same files, minus the MCP servers that must
+// not start (all of them, or with --allow-real-servers only the mocked ones). Built once per server set.
+const shadowPlugins = new Map();
+function pluginFor(c) {
+  if (opt.mocks !== 'record' || !pluginHasServers) return Promise.resolve(pluginDir);
+  const mocked = new Set(c.mockPlan.filter((p) => p.shadow).map((p) => p.declaredAs));
+  const keep = opt.allowRealServers ? Object.fromEntries(Object.entries(declared.servers).filter(([k]) => !mocked.has(k))) : {};
+  const sig = JSON.stringify(Object.keys(keep).sort());
+  if (!shadowPlugins.has(sig)) shadowPlugins.set(sig, (async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'eval-shim-plugin-'));
+    const evalTop = path.relative(pluginDir, evalDir).split(path.sep)[0];
+    for (const e of await fs.readdir(pluginDir, { withFileTypes: true })) {
+      if (e.name === '.mcp.json') continue;
+      const src = path.join(pluginDir, e.name), dst = path.join(dir, e.name);
+      if (['node_modules', '.git', evalTop].includes(e.name)) await fs.symlink(src, dst);
+      else await fs.cp(src, dst, { recursive: true, verbatimSymlinks: true });
+    }
+    const mf = path.join(dir, '.claude-plugin/plugin.json');
+    const m = JSON.parse(await fs.readFile(mf, 'utf8'));
+    delete m.mcpServers;
+    if (Object.keys(keep).length) m.mcpServers = keep;
+    await fs.writeFile(mf, JSON.stringify(m, null, 2));
+    return dir;
+  })());
+  return shadowPlugins.get(sig);
+}
+const MOCK_SERVER = path.join(path.dirname(new URL(import.meta.url).pathname), 'eval-mock-server.mjs');
+async function writeMockConfig(plan) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'eval-shim-mocks-'));
+  const mcpServers = {};
+  for (const p of plan) {
+    const tools = [...p.tools.keys()].map((name) => {
+      const t = p.source.tools.get(name);
+      const listed = (p.source.listing ?? []).find((x) => x?.name === name) ?? {};
+      return { name, description: listed.description ?? `${name} on ${p.declaredAs ?? p.dir} (eval mock)`, inputSchema: listed.inputSchema ?? { type: 'object', additionalProperties: true }, body: t.body, error: t.error, expect: t.expect, dir: t.dir };
+    });
+    const specPath = path.join(dir, `${p.key}.json`);
+    await fs.writeFile(specPath, JSON.stringify({ dir: p.dir, tools }));
+    mcpServers[p.key] = { type: 'stdio', command: process.execPath, args: [MOCK_SERVER, specPath] };
+  }
+  const configPath = path.join(dir, 'mcp.json');
+  await fs.writeFile(configPath, JSON.stringify({ mcpServers }));
+  return { dir, configPath };
+}
+
+// ---------- isolated config (mirrors the official sandbox: fresh CLAUDE_CONFIG_DIR + creds copied in) ----------
+const userConfig = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude');
+const SAFETY_NET = path.join(path.dirname(new URL(import.meta.url).pathname), 'safety-net.mjs');
+async function makeConfigDir() {
+  if (!opt.isolate) return null;
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'eval-shim-cfg-'));
+  for (const f of ['.credentials.json']) if (existsSync(path.join(userConfig, f))) await fs.copyFile(path.join(userConfig, f), path.join(dir, f));
+  const settings = { hasCompletedOnboarding: true, theme: 'dark' };
+  if (opt.safetyNet) settings.hooks = { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: `node ${JSON.stringify(SAFETY_NET)}` }] }] };
+  await fs.writeFile(path.join(dir, 'settings.json'), JSON.stringify(settings));
+  return dir;
+}
+
+// ---------- one agent run ----------
+async function runAgent(c, arm) {
+  const ws = await fs.mkdtemp(path.join(os.tmpdir(), `eval-shim-ws-${c.dir}-`));
+  if (c.scaffoldScript) {
+    if (!opt.scaffold) log(`    (scaffold_script present but --scaffold not given: skipping)`);
+    else {
+      // a script file runs by path, as the official runner does, so ${BASH_SOURCE[0]} finds the case dir
+      const args = c.scaffoldPath ? ['-euo', 'pipefail', c.scaffoldPath] : ['-euo', 'pipefail', '-c', c.scaffoldScript];
+      const r = await exec('bash', args, { cwd: ws, env: { ...process.env, EVAL_PLUGIN_ROOT: pluginDir, EVAL_CASE: c.dir }, timeout: 120_000 });
+      if (r.code !== 0) log(`    scaffold failed: ${r.stderr.slice(-300)}`);
+    }
+  }
+  // other agents read their own context file, not CLAUDE.md: bridge whatever the scaffold
+  // provided, so the same cases exercise the same instructions everywhere (skills stay Claude-only)
+  const bridge = { codex: 'AGENTS.md', gemini: 'GEMINI.md' }[agent];
+  if (bridge && existsSync(path.join(ws, 'CLAUDE.md')) && !existsSync(path.join(ws, bridge))) await fs.copyFile(path.join(ws, 'CLAUDE.md'), path.join(ws, bridge));
+  const before = await snapshot(ws);
+  const cfg = await makeConfigDir();
+  if (agent === 'codex') {
+    // Codex: fixture-tested and live-run (54-run comparison, 2026-10-24); field shapes calibrated defensively against codex exec --json
+    const cargs = ['exec', '--json', '--skip-git-repo-check', '--sandbox', 'workspace-write', c.prompt];
+    const cenv = { ...process.env };
+    if (existsSync(path.join(ws, '.eval-bin'))) cenv.PATH = path.join(ws, '.eval-bin') + path.delimiter + (cenv.PATH ?? '');
+    const t0 = Date.now();
+    const { stdout, stderr, code, timedOut } = await exec('codex', cargs, { cwd: ws, env: cenv, timeout: c.timeout });
+    const events = stdout.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const texts = [], toolUses = [], toolResults = [];
+    let inTok = null, outTok = null, errored = false, model = null;
+    for (const e of events) {
+      const item = e.item ?? e.msg ?? e;
+      const t = item?.type ?? e.type;
+      if ((t === 'agent_message' || t === 'assistant_message') && (item.text ?? item.message)) texts.push(String(item.text ?? item.message));
+      if (['command_execution', 'exec_command_end', 'local_shell_call', 'shell_call'].includes(t)) { toolUses.push({ tool: 'Bash', input: String(item.command ?? item.cmd ?? '').slice(0, 500) }); if (item.output ?? item.aggregated_output) toolResults.push({ error: (item.exit_code ?? 0) !== 0, text: String(item.output ?? item.aggregated_output).slice(0, 600) }); }
+      if (['file_change', 'patch_apply_end', 'apply_patch'].includes(t)) toolUses.push({ tool: 'Edit', input: String(item.path ?? (item.changes ?? []).map((x) => x.path).join(',')).slice(0, 500) });
+      if (['token_count', 'turn.completed', 'turn_complete'].includes(t)) { const u = item.usage ?? item.info ?? item; inTok = u.input_tokens ?? inTok; outTok = u.output_tokens ?? outTok; }
+      if (t === 'error' || t === 'turn.failed' || e.type === 'error') errored = true;
+      model = item.model ?? e.model ?? model;
+    }
+    const after0 = await snapshot(ws);
+    const files0 = [...after0.keys()].filter((f) => !before.has(f) || before.get(f) !== after0.get(f));
+    const fileContents0 = {};
+    for (const f of files0) { try { const st = await fs.stat(path.join(ws, f)); if (st.size < 200_000) fileContents0[f] = await fs.readFile(path.join(ws, f), 'utf8'); } catch {} }
+    const workspaceFiles = await readRefs(ws, c);
+    if (cfg) await fs.rm(cfg, { recursive: true, force: true });
+    await fs.rm(ws, { recursive: true, force: true });
+    const isErr = errored || (code !== 0 && texts.length === 0) || (texts.length === 0 && toolUses.length === 0);
+    return { workspaceFiles, lastMessage: texts.join('\n\n'), finalMessage: texts.at(-1) ?? '', texts, toolUses, toolResults, files: files0, fileContents: fileContents0, trace: events, costUsd: null, inputTokens: inTok, outputTokens: outTok, numTurns: texts.length || null, isError: isErr, truncated: false, resultSubtype: null, exitCode: code, timedOut, durationMs: Date.now() - t0, stderr: stderr.slice(-2000), rawTail: isErr ? stdout.slice(-1500) : '', model: model ?? 'codex' };
+  }
+  if (agent === 'gemini') {
+    // Gemini: gemini -p is headless but emits plain text, so tool-call evidence is not
+    // machine-readable; graders that need it are skipped, content graders score the reply.
+    const genv = { ...process.env };
+    if (existsSync(path.join(ws, '.eval-bin'))) genv.PATH = path.join(ws, '.eval-bin') + path.delimiter + (genv.PATH ?? '');
+    const t0 = Date.now();
+    const { stdout, stderr, code, timedOut } = await exec('gemini', ['-p', c.prompt, '--approval-mode', 'yolo', '--skip-trust'], { cwd: ws, env: genv, timeout: c.timeout });
+    const text = stdout.trim();
+    const after0 = await snapshot(ws);
+    const files0 = [...after0.keys()].filter((f) => !before.has(f) || before.get(f) !== after0.get(f));
+    const fileContents0 = {};
+    for (const f of files0) { try { const st = await fs.stat(path.join(ws, f)); if (st.size < 200_000) fileContents0[f] = await fs.readFile(path.join(ws, f), 'utf8'); } catch {} }
+    const workspaceFiles = await readRefs(ws, c);
+    if (cfg) await fs.rm(cfg, { recursive: true, force: true });
+    await fs.rm(ws, { recursive: true, force: true });
+    return { workspaceFiles, lastMessage: text, finalMessage: text, texts: text ? [text] : [], toolUses: [], toolEvidence: false, toolResults: [], files: files0, fileContents: fileContents0, trace: [], costUsd: null, inputTokens: null, outputTokens: null, numTurns: null, isError: code !== 0 || !text, truncated: false, resultSubtype: null, exitCode: code, timedOut, durationMs: Date.now() - t0, stderr: stderr.slice(-2000), rawTail: code !== 0 ? stdout.slice(-800) : '', model: 'gemini' };
+  }
+  const args = ['-p', c.prompt, '--output-format', 'stream-json', '--verbose', '--setting-sources', opt.safetyNet && cfg ? 'user' : '', '--permission-mode', 'dontAsk', '--max-turns', String(c.maxTurns), '--model', c.model];
+  // shadow mocks stand in for the plugin's servers, so they exist only where the plugin is loaded
+  const mocked = (c.mockPlan ?? []).filter((p) => arm === 'with' || !p.shadow);
+  const mockFiles = mocked.length ? await writeMockConfig(mocked) : null;
+  if (mockFiles) args.push('--mcp-config', mockFiles.configPath);
+  if (arm === 'with') args.push('--plugin-dir', await pluginFor(c));
+  const allowed = [...c.allowedTools, ...mocked.flatMap((p) => p.fullNames)]; // mocked tools need no grant, as in the official runner
+  if (allowed.length) args.push('--allowedTools', ...allowed);
+  if (c.disallowedTools.length) args.push('--disallowedTools', ...c.disallowedTools); // removed even when granted, as in the official runner
+  const env = { ...process.env, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' };
+  delete env.ANTHROPIC_MODEL;
+  if (existsSync(path.join(ws, '.eval-bin'))) env.PATH = path.join(ws, '.eval-bin') + path.delimiter + (env.PATH ?? '');
+  if (cfg) env.CLAUDE_CONFIG_DIR = cfg;
+  const t0 = Date.now();
+  const { stdout, stderr, code, timedOut } = await exec('claude', args, { cwd: ws, env, timeout: c.timeout });
+  const events = stdout.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  const texts = [], toolUses = [], toolResults = [], calls = [], callById = new Map();
+  let result = null;
+  for (const e of events) {
+    if (e.type === 'assistant') for (const b of e.message?.content ?? []) {
+      if (b.type === 'text' && b.text?.trim()) texts.push(b.text);
+      if (b.type === 'tool_use') { toolUses.push({ tool: b.name, input: b.input }); const call = { name: b.name, input: b.input }; calls.push(call); if (b.id) callById.set(b.id, call); }
+    }
+    if (e.type === 'user') for (const b of e.message?.content ?? []) {
+      if (b.type === 'tool_result') {
+        const c = Array.isArray(b.content) ? b.content.map((x) => x.text ?? '').join('\n') : String(b.content ?? '');
+        toolResults.push({ error: !!b.is_error, text: c.slice(0, 600) });
+        const call = callById.get(b.tool_use_id); if (call) { call.output = c; call.isError = !!b.is_error; }
+      }
+    }
+    if (e.type === 'result') result = e;
+  }
+  // mock_calls, in the official runner's shape: one { tool, input, output, isError, verdict } per call to a mocked tool
+  const mockNames = new Set(mocked.flatMap((p) => p.fullNames));
+  const mockCalls = mockFiles ? calls.filter((x) => mockNames.has(x.name)).map((x) => ({ tool: x.name, input: x.input, ...(x.output !== undefined && { output: x.output }), ...(x.isError && { isError: true }), verdict: x.isError === undefined ? 'no_result' : !x.isError ? 'ok' : x.output.startsWith(ABORT_PREFIX) ? 'abort' : 'tool_error' })) : null;
+  const abortCall = (mockCalls ?? []).find((x) => x.verdict === 'abort');
+  const abortWhy = abortCall?.output.slice(ABORT_PREFIX.length).trim().match(/^([^/]+)\/([^:]+): ([\s\S]*)$/);
+  const aborted = abortCall ? (abortWhy ? { server: abortWhy[1], tool: abortWhy[2], reason: abortWhy[3] } : { server: '?', tool: abortCall.tool, reason: abortCall.output }) : null;
+  if (mockFiles) await fs.rm(mockFiles.dir, { recursive: true, force: true });
+  const after = await snapshot(ws);
+  const files = [...after.keys()].filter((f) => !before.has(f) || before.get(f) !== after.get(f)); // created or modified by the agent
+  const fileContents = {};
+  for (const f of files) { try { const s = await fs.stat(path.join(ws, f)); if (s.size < 200_000) fileContents[f] = await fs.readFile(path.join(ws, f), 'utf8'); } catch {} }
+  const workspaceFiles = await readRefs(ws, c);
+  if (cfg) await fs.rm(cfg, { recursive: true, force: true });
+  await fs.rm(ws, { recursive: true, force: true });
+  return { mockCalls, aborted, workspaceFiles, lastMessage: texts.length ? texts.join('\n\n') : (result?.result ?? ''), finalMessage: result?.result ?? texts.at(-1) ?? '', texts, toolUses, toolResults, files, fileContents, trace: events, costUsd: result?.total_cost_usd ?? null, inputTokens: result?.usage?.input_tokens ?? null, outputTokens: result?.usage?.output_tokens ?? null, numTurns: result?.num_turns ?? null, isError: !result || (!!result.is_error && !String(result.subtype ?? '').startsWith('error_max_turns')), truncated: !!result && (String(result.subtype ?? '').startsWith('error_max_turns') || (!result.is_error && code !== 0)), resultSubtype: result?.subtype ?? null, exitCode: code, timedOut, durationMs: Date.now() - t0, stderr: stderr.slice(-2000), rawTail: result ? '' : stdout.slice(-1500), model: result?.modelUsage ? Object.keys(result.modelUsage)[0] : c.model };
+}
+async function readRefs(ws, c) {
+  const out = {};
+  for (const g of c.graders ?? []) {
+    const ref = fileRefPath(g);
+    if (!ref || ref in out) continue;
+    try { const fp = path.join(ws, ref); const st = await fs.stat(fp); out[ref] = st.size < 400_000 ? await fs.readFile(fp, 'utf8') : ''; } catch { out[ref] = ''; }
+  }
+  return out;
+}
+async function snapshot(dir) {
+  const m = new Map();
+  for (const f of await walk(dir)) { try { const s = await fs.stat(path.join(dir, f)); m.set(f, `${s.size}:${Math.round(s.mtimeMs)}`); } catch {} }
+  return m;
+}
+async function walk(dir, rel = '') {
+  const out = [];
+  for (const e of await fs.readdir(dir, { withFileTypes: true })) {
+    if (e.name === '.git') continue;
+    const r = path.join(rel, e.name);
+    if (e.isDirectory()) out.push(...(await walk(path.join(dir, e.name), r))); else out.push(r);
+  }
+  return out;
+}
+function exec(cmd, args, { cwd, env, timeout, input }) {
+  return new Promise((resolve) => {
+    const p = spawn(cmd, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '', timedOut = false;
+    p.stdout.on('data', (d) => (stdout += d)); p.stderr.on('data', (d) => (stderr += d));
+    const t = setTimeout(() => { timedOut = true; p.kill('SIGTERM'); }, timeout);
+    p.on('close', (code) => { clearTimeout(t); resolve({ stdout, stderr, code, timedOut }); });
+    if (input) p.stdin.write(input); p.stdin.end();
+  });
+}
+
+// official form { source: file, path: <path> }: the contents of one workspace file after the run
+function fileRefPath(g) {
+  const t = g.focus ?? g.target;
+  if (t && typeof t === 'object' && t.path) return String(t.path).trim();
+  const m = typeof t === 'string' && t.match(/^\{\s*source:\s*file\s*,\s*path:\s*["']?([^"'}]+?)["']?\s*\}$/);
+  return m ? m[1].trim() : null;
+}
+
+// ---------- graders ----------
+function targetText(g, run) {
+  const t = g.focus ?? g.target ?? 'last_message';
+  const ref = fileRefPath(g);
+  if (ref) return run.workspaceFiles?.[ref] ?? '';
+  if (t === 'last_message') return run.lastMessage; // all assistant text for the run (robust to sub-agent chatter); 'final_message' = the closing message only
+  if (t === 'final_message') return run.finalMessage;
+  if (t === 'mock_calls') return (run.mockCalls ?? []).map((x) => JSON.stringify(x)).join('\n');
+  if (t === 'trace') return run.trace.length ? run.trace.map((e) => JSON.stringify(e)).join('\n') : [...run.toolUses.map((u) => 'TOOL_USE ' + JSON.stringify(u)), ...(run.toolResults ?? []).map((r) => 'TOOL_RESULT' + (r.error ? '(error) ' : ' ') + r.text), ...run.texts].join('\n');
+  // legacy shim meaning (contents of changed files); the official runner reads 'files' as the list of
+  // created paths only, so suites meant for both should grade { source: file, path } or last_message
+  if (t === 'files') return Object.entries(run.fileContents).map(([f, c]) => `### ${f}\n${c}`).join('\n\n');
+  return run.lastMessage;
+}
+const targetsMockCalls = (g) => (g.type === 'regex' && g.target === 'mock_calls') || (g.type === 'llm' && g.focus === 'mock_calls');
+async function grade(g, run, arm, ablating) {
+  const only = g.arm === 'with-only' ? 'with' : g.arm; // official 'with-only' = the shim's older 'with'
+  const armScoped = (only === 'with' || only === 'without') && only !== arm;
+  const base = { name: g.name, type: g.type, scored: !armScoped, withOnly: false, armOnly: armScoped ? only : undefined };
+  if (targetsMockCalls(g)) {
+    // like Skill indicators: calls to mocks of the plugin's own servers cannot happen without the plugin
+    if (g.arm === undefined && run.mockCallsWithOnly) { base.withOnly = true; if (ablating) base.scored = false; }
+    if (ablating && base.withOnly && arm === 'without') return { ...base, score: null, verdict: 'skipped', reason: 'with-only indicator: the mocked servers belong to the plugin' };
+    if (!run.mockCalls) return { ...base, score: 0, verdict: 'fail', reason: 'no mock stand-ins were active in this run (--mocks off, or no mocks/ directory applies to this case), so a mock_calls grader has nothing to check' };
+  }
+  if (g.type === 'regex') {
+    const re = new RegExp(String(g.pattern), String(g.flags ?? '') + (String(g.flags ?? '').includes('s') ? '' : 's'));
+    const txt = targetText(g, run);
+    const mode = String(g.match ?? 'contains');
+    let pass;
+    if (mode === 'contains') pass = re.test(txt);
+    else if (mode === 'not_contains') pass = !re.test(txt);
+    else if (mode.startsWith('count:')) pass = (txt.match(new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g')) ?? []).length >= Number(mode.slice(6));
+    else pass = re.test(txt);
+    return { ...base, score: pass ? 1 : 0, verdict: pass ? 'pass' : 'fail' };
+  }
+  if (g.type === 'tool_used') {
+    if (agent !== 'claude' && g.tool === 'Skill') return { ...base, score: null, verdict: 'skipped', scored: false, reason: `the Skill tool does not exist on ${agent}; Claude-only indicator` };
+    if (run.toolEvidence === false) return { ...base, score: null, verdict: 'skipped', scored: false, reason: `${agent} emits no machine-readable tool calls headlessly; indicator skipped` };
+    const im = g.input_match ? new RegExp(String(g.input_match), 's') : null;
+    const n = run.toolUses.filter((u) => u.tool === g.tool && (!im || im.test(typeof u.input === 'string' ? u.input : JSON.stringify(u.input)))).length;
+    const max = g.max, min = g.min ?? (max === 0 ? 0 : 1);
+    const pass = n >= min && (max === undefined || n <= max);
+    const withOnly = g.tool === 'Skill' && g.arm !== 'both';
+    return { ...base, score: pass ? 1 : 0, verdict: pass ? 'pass' : 'fail', count: n, withOnly, scored: base.scored && !(ablating && withOnly) };
+  }
+  if (g.type === 'file_exists') {
+    const re = globToRe(String(g.path));
+    const pass = run.files.some((f) => re.test(f));
+    return { ...base, score: pass ? 1 : 0, verdict: pass ? 'pass' : 'fail' };
+  }
+  if (g.type === 'llm') {
+    const txt = targetText(g, run) || (g.focus === 'mock_calls' ? '(no mocked tool calls)' : '');
+    const judgePrompt = `You are grading an AI coding agent's output against a rubric. Reply with ONLY a JSON object: {"pass": true|false, "reason": "<one sentence>"}. If the output under test does not actually contain the artifact the criteria describe (e.g. no code, only commentary), answer pass=false.\n\nCRITERIA:\n${g.criteria ?? ''}\n\nRUBRIC NOTES:\n${g.rubric}\n\nOUTPUT UNDER TEST:\n<<<\n${txt.slice(0, 60_000)}\n>>>`;
+    const cfg = await makeConfigDir();
+    const env = { ...process.env, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' }; if (cfg) env.CLAUDE_CONFIG_DIR = cfg;
+    const { stdout } = await exec('claude', ['-p', judgePrompt, '--output-format', 'json', '--setting-sources', '', '--permission-mode', 'dontAsk', '--max-turns', '1', '--model', opt.judgeModel, '--disallowedTools', 'Bash', 'Write', 'Edit', 'Read', 'WebFetch', 'WebSearch', 'Skill', 'Task'], { cwd: os.tmpdir(), env, timeout: 120_000 });
+    if (cfg) await fs.rm(cfg, { recursive: true, force: true });
+    let verdict = { pass: false, reason: 'judge produced no parseable verdict' };
+    try { const r = JSON.parse(stdout).result ?? ''; const m = r.match(/\{[\s\S]*\}/); if (m) verdict = JSON.parse(m[0]); } catch {}
+    return { ...base, score: verdict.pass ? 1 : 0, verdict: verdict.pass ? 'pass' : 'fail', reason: verdict.reason };
+  }
+  return { ...base, score: null, verdict: 'skipped', scored: false, reason: `grader type ${g.type} not supported by shim` };
+}
+
+// ---------- regrade support ----------
+const regradeSource = opt.regrade ? JSON.parse(await fs.readFile(opt.regrade, 'utf8')) : null;
+// regrade inherits the saved run's ablation mode — the CLI default must not decide which graders count
+if (regradeSource) opt.ablation = regradeSource.cases?.some((x) => x.arms?.without?.length) ? 'with-without' : 'none';
+function fromSaved(r) {
+  const toolUses = (r.toolUses ?? []).map((u) => ({ tool: u.tool, input: (() => { try { return JSON.parse(u.input); } catch { return u.input; } })() }));
+  // Saved runs from older runner versions flagged max_turns exits as errors. A run that made tool calls and
+  // produced a response did real work: classify it as truncated (scored as-is), not errored.
+  const didWork = toolUses.length > 0 && !!(r.response && r.response.trim());
+  const isError = !!r.isError && !didWork && !r.truncated;
+  const truncated = !!r.truncated || (!!r.isError && didWork);
+  return { mockCalls: r.mockCalls ?? null, aborted: r.aborted ?? null, workspaceFiles: r.workspaceFiles ?? {}, lastMessage: r.response ?? '', finalMessage: r.response ?? '', texts: [r.response ?? ''], toolUses, toolResults: r.toolResults ?? [], files: r.filesChanged ?? [], fileContents: r.fileContents ?? {}, trace: [], costUsd: 0, inputTokens: r.inputTokens, outputTokens: r.outputTokens, numTurns: r.numTurns, isError, truncated, resultSubtype: r.resultSubtype ?? (truncated ? 'error_max_turns (inferred)' : null), exitCode: r.exitCode ?? null, timedOut: r.timedOut, durationMs: r.durationMs, stderr: '', model: r.model };
+}
+
+// ---------- drive ----------
+const ablating = opt.ablation === 'with-without';
+const arms = ablating ? ['with', 'without'] : ['with'];
+const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+const outDir = opt.outputDir ?? path.join(evalDir, 'results', stamp);
+await fs.mkdir(outDir, { recursive: true });
+const modelLabel = opt.model ?? (new Set(cases.map((c) => c.model)).size === 1 ? cases[0].model : 'per-case');
+log(`eval-shim: ${pluginName} · ${cases.length} case(s) · arms=${arms.join(',')} · track=${track.track} · model=${modelLabel}${track.track === 'pinned' && !track.modelIsPinned && !opt.model ? ' (unpinned alias)' : ''} · claude-code=${harnessVersion ?? '?'} · judge=${opt.judgeModel}${opt.expand ? ` · expand-on-deviation=${opt.expand}` : ''}${opt.budget ? ` · budget=$${opt.budget}` : ''}${opt.concurrency > 1 ? ` · concurrency=${opt.concurrency}` : ''}${opt.regrade ? ' · REGRADE of ' + path.basename(path.dirname(opt.regrade)) : ''}`);
+const report = {
+  schemaVersion: '1.1', shim: true, agent, track: track.track,
+  harness: { name: 'claude-code', version: opt.regrade ? (regradeSource?.harness?.version ?? harnessVersion) : harnessVersion },
+  judge: { model: opt.judgeModel },
+  config: { model: modelLabel, modelIsPinned: opt.model ? true : track.modelIsPinned, harness: String(track.harness), harnessIsPinned: track.harnessIsPinned, expandOnDeviation: opt.expand || 0, budgetUsd: opt.budget, file: cdc._exists ? path.basename(cdc._path) : null },
+  startedAt: new Date().toISOString(), generatedAt: opt.regrade ? (regradeSource?.generatedAt ?? new Date().toISOString()) : new Date().toISOString(), regradedAt: opt.regrade ? new Date().toISOString() : undefined, regradeOf: opt.regrade ?? undefined,
+  suite: { name: pluginName, caseCount: cases.length, baselineOnly: false },
+  discovered: { skills: await discoverSkills(pluginDir) },
+  cases: [], aggregates: {},
+};
+let totalCost = 0, erroredRuns = 0, truncatedRuns = 0, firstError = null, budgetExceeded = false, skippedRuns = 0;
+const overBudget = () => opt.budget !== null && totalCost >= opt.budget;
+
+// A FIFO-by-key slot pool: at most opt.concurrency agent runs in flight, and a free slot always goes to
+// the earliest waiting (case, arm, run). At --concurrency 1 that is exactly the old sequential order.
+function makePool(size) {
+  let active = 0;
+  const waiting = [];
+  const before = (a, b) => a.key[0] - b.key[0] || a.key[1] - b.key[1];
+  const pump = () => { while (active < size && waiting.length) { waiting.sort(before); active++; waiting.shift().go(); } };
+  return { acquire: (key) => new Promise((go) => { waiting.push({ key, go }); pump(); }), release: () => { active--; pump(); } };
+}
+const pool = makePool(opt.concurrency);
+
+// One (case, arm) group: its runs go through the pool; results land by index, so order never depends on
+// which run finished first. The budget is checked when a slot is granted, right before a run would start.
+async function runGroup(gi, c, arm, saved) {
+  const nRuns = saved ? saved.length : c.runs;
+  const results = [], extra = [];
+  let target = nRuns, firstLeft = nRuns, firstSkipped = false;
+  const slot = async (i) => {
+    await pool.acquire([gi, i]);
+    try {
+      if (!saved && overBudget()) { // budget: never start a run past the cap; what already ran is kept and scored
+        if (!budgetExceeded) log(`  ■ budget: $${totalCost.toFixed(2)} spent ≥ $${opt.budget} cap — not starting more agent runs`);
+        budgetExceeded = true; skippedRuns++; if (i < nRuns) firstSkipped = true;
+        return;
+      }
+      log(`  ▸ ${c.dir} [${arm}] ${saved ? 'regrade' : 'run'} ${i + 1}/${target} …`);
+      const run = saved ? fromSaved(saved[i]) : await runAgent(c, arm);
+      run.mockCallsWithOnly = !!c.mockCallsWithOnly;
+      const graders = [];
+      for (const g of c.graders) {
+        if (saved && g.type === 'llm' && !opt.regradeLlm) { const prev = saved[i].graders?.find((x) => x.name === g.name); graders.push(prev ? { ...prev, regraded: false } : { name: g.name, type: g.type, score: null, verdict: 'skipped', scored: false, reason: 'no saved verdict; use --regrade-llm' }); continue; }
+        graders.push(await grade(g, run, arm, ablating));
+      }
+      const scored = graders.filter((g) => g.scored && g.score !== null);
+      // a mock's expect: guard that tripped aborts the run: score 0, error stays null (the official verdict)
+      const score = run.isError ? null : run.aborted ? 0 : (scored.length ? scored.reduce((s, g) => s + g.score, 0) / scored.length : null);
+      if (run.isError) { erroredRuns++; if (!firstError) firstError = (run.lastMessage || run.stderr || run.rawTail || `claude exited ${run.exitCode} with no output`).trim().slice(0, 300); }
+      totalCost += run.costUsd ?? 0;
+      results[i] = { runIndex: i, score, graders, ...(run.aborted && { aborted: run.aborted }), ...(run.mockCalls && { mockCalls: run.mockCalls }), costUsd: run.costUsd, inputTokens: run.inputTokens, outputTokens: run.outputTokens, numTurns: run.numTurns, durationMs: run.durationMs, model: run.model, isError: run.isError, truncated: run.truncated, resultSubtype: run.resultSubtype, timedOut: run.timedOut, toolUses: run.toolUses.map((u) => ({ tool: u.tool, input: typeof u.input === 'string' ? u.input : JSON.stringify(u.input).slice(0, 500) })), toolResults: run.toolResults ?? [], prompt: c.prompt, response: run.lastMessage, filesChanged: run.files, fileContents: run.fileContents, workspaceFiles: run.workspaceFiles ?? {}, stderrTail: run.isError ? (run.stderr || run.rawTail || `exit ${run.exitCode}, no output`) : undefined, exitCode: run.exitCode };
+      const tag = opt.concurrency > 1 ? `${c.dir} [${arm}] ${i + 1}: ` : '';
+      if (run.aborted) log(`    ${tag}ABORTED by mock ${run.aborted.server}/${run.aborted.tool}: ${run.aborted.reason}`);
+      if (run.isError) log(`    ${tag}ERROR (exit ${run.exitCode}): ${(run.lastMessage || run.stderr || run.rawTail || 'no output').trim().slice(0, 300)}`);
+      if (run.truncated) { truncatedRuns++; log(`    ${tag}TRUNCATED (${run.resultSubtype || 'exit ' + run.exitCode}, ${run.numTurns} turns): scored as-is — raise max_turns for this case`); }
+      log(`    ${tag}score=${fmt(score)}  ${graders.map((g) => `${g.verdict === 'pass' ? '✓' : g.verdict === 'fail' ? '✗' : '·'}${g.name}${g.scored ? '' : '(ind)'}`).join(' ')}`);
+    } finally {
+      // sequential testing: the configured runs are the cheap first look; only a deviation buys more evidence.
+      // Queued before this slot is released, so at --concurrency 1 the extra runs go next, as they always did.
+      if (i < nRuns && --firstLeft === 0 && !saved && !firstSkipped && opt.expand > 0 && results.some((r) => r && r.score !== 1)) {
+        target += opt.expand;
+        log(`    ↳ ${c.dir} [${arm}]: deviation in the first ${nRuns} run(s) — expanding by ${opt.expand} more`);
+        for (let k = nRuns; k < target; k++) extra.push(slot(k));
+      }
+      pool.release();
+    }
+  };
+  await Promise.all(Array.from({ length: nRuns }, (_, i) => slot(i)));
+  await Promise.all(extra);
+  return results.filter(Boolean);
+}
+
+const groups = [];
+const entries = cases.map((c) => {
+  const entry = { name: c.name, dir: c.dir, tags: c.tags, covers: c.covers, description: c.description, prompt: c.prompt, scaffold: c.scaffoldScript, graders: c.graders.map((g) => ({ name: g.name, type: g.type, rubric: g.rubric, target: g.target ?? null, focus: g.focus ?? null, pattern: g.pattern ?? null, match: g.match ?? null, tool: g.tool ?? null, input_match: g.input_match ?? null, min: g.min ?? null, max: g.max ?? null, path: g.path ?? null, criteria: g.criteria ?? null, arm: g.arm ?? null })), ...(c.disallowedTools.length && { disallowedTools: c.disallowedTools }), arms: {}, summary: {} };
+  if (c.unsupported || c.loadError) { // never run: unknown (unsupported here) or 0 (the official runner cannot load it either)
+    if (c.unsupported) entry.unsupported = c.unsupported; else entry.loadError = c.loadError;
+    log(`  ▸ ${c.dir}: ${c.unsupported ? 'UNSUPPORTED, ' + c.unsupported : 'LOAD ERROR, ' + c.loadError}`);
+    return entry;
+  }
+  for (const arm of arms) {
+    const saved = opt.regrade ? (regradeSource.cases.find((x) => (x.dir ?? x.name) === c.dir)?.arms?.[arm] ?? []) : null;
+    if (saved && !saved.length) continue;
+    entry.arms[arm] = [];
+    groups.push(runGroup(groups.length, c, arm, saved).then((runs) => { entry.arms[arm] = runs; }));
+  }
+  return entry;
+});
+await Promise.all(groups);
+for (const dir of await Promise.all(shadowPlugins.values())) await fs.rm(dir, { recursive: true, force: true });
+for (const entry of entries) {
+  if (opt.regrade && !Object.keys(entry.arms).length && !entry.unsupported && !entry.loadError) { log(`  ▸ ${entry.dir}: no saved runs in source — skipped`); continue; }
+  const mean = (arr) => arr.filter((x) => x !== null).length ? arr.filter((x) => x !== null).reduce((a, b) => a + b, 0) / arr.filter((x) => x !== null).length : null;
+  entry.summary.score = entry.loadError ? 0 : mean((entry.arms.with ?? []).map((r) => r.score));
+  if (ablating && entry.arms.without) { entry.summary.baselineScore = mean(entry.arms.without.map((r) => r.score)); entry.summary.delta = entry.summary.score !== null && entry.summary.baselineScore !== null ? entry.summary.score - entry.summary.baselineScore : null; }
+  entry.summary.costUsd = Object.values(entry.arms).flat().reduce((s, r) => s + (r.costUsd ?? 0), 0);
+  report.cases.push(entry);
+}
+const withScores = report.cases.map((c) => c.summary.score).filter((s) => s !== null);
+const totalRuns = report.cases.reduce((n, c) => n + Object.values(c.arms).flat().length, 0);
+const resolvedModels = [...new Set(report.cases.flatMap((c) => (c.arms.with ?? []).map((r) => r.model)).filter(Boolean))];
+report.aggregates = { overallScore: withScores.length ? withScores.reduce((a, b) => a + b, 0) / withScores.length : null, passed: report.cases.filter((c) => c.summary.score === 1).length, failed: report.cases.filter((c) => c.summary.score !== null && c.summary.score !== 1).length, costUsd: totalCost, erroredRuns, truncatedRuns, totalRuns, partialReason: erroredRuns ? `${erroredRuns} of ${totalRuns} agent runs errored: ${firstError}` : null, resolvedModels, budget: opt.budget !== null ? { capUsd: opt.budget, spentUsd: totalCost, exceeded: budgetExceeded, skippedRuns } : null };
+if (budgetExceeded) log(`\nBUDGET CAP: stopped after $${totalCost.toFixed(2)} (cap $${opt.budget}); ${skippedRuns} planned run(s) not started — cases without runs score as unknown, not as regressions`);
+if (!opt.regrade) report.generatedAt = new Date().toISOString(); // stamp at completion; startedAt keeps the start
+const outPath = path.join(outDir, 'aggregate-result.json');
+await fs.writeFile(outPath, JSON.stringify(report, null, 2));
+await fs.writeFile(path.join(outDir, 'report.html'), renderReport(report));
+if (opt.json === '-') process.stdout.write(JSON.stringify(report, null, 2));
+else if (opt.json) await fs.writeFile(opt.json, JSON.stringify(report, null, 2));
+
+log('\n' + pad('case', 44) + pad('with', 8) + (ablating ? pad('without', 9) + pad('delta', 8) : '') + 'cost');
+for (const c of report.cases) log(pad(c.dir, 44) + pad(fmt(c.summary.score), 8) + (ablating ? pad(fmt(c.summary.baselineScore), 9) + pad(fmtDelta(c.summary.delta), 8) : '') + `$${c.summary.costUsd.toFixed(3)}`);
+log(`\noverall=${fmt(report.aggregates.overallScore)} passed=${report.aggregates.passed}/${cases.length} cost=$${totalCost.toFixed(3)}${erroredRuns ? `\nERRORED RUNS: ${report.aggregates.partialReason}` : ''}${truncatedRuns ? `\nTRUNCATED RUNS: ${truncatedRuns} hit max_turns — scored as-is; raise max_turns on those cases` : ''}\n→ ${outPath}\n→ ${path.join(outDir, 'report.html')}`);
+if (erroredRuns === totalRuns && totalRuns > 0) process.exitCode = 2; // nothing ran: partial, like the official runner
+function fmt(s) { return s === null || s === undefined ? '—' : s.toFixed(2); }
+function fmtDelta(d) { return d === null || d === undefined ? '—' : (d >= 0 ? '+' : '') + d.toFixed(2); }
+function pad(s, n) { return String(s).padEnd(n); }
